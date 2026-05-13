@@ -150,7 +150,7 @@ If you use Deep Thought in your research, please cite:
 
 ## License
 
-MIT License - see LICENSE file for details.
+MLP License - see LICENSE file for details.
 
 ## Acknowledgments
 
