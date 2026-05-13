@@ -95,6 +95,7 @@ class DeepThoughtAgent(nn.Module):
                 world_model_constraint_coef=gov.world_model_constraint_coef,
                 compute_penalty_constraint_coef=gov.compute_penalty_constraint_coef,
                 memory_coherence_constraint_coef=gov.memory_coherence_constraint_coef,
+                capability_density_coef=getattr(gov, 'capability_density_coef', 0.01),
                 memory_read_filter_threshold=gov.memory_read_filter_threshold,
                 memory_influence_on_pruning=gov.memory_influence_on_pruning,
                 memory_influence_on_growth=gov.memory_influence_on_growth,
@@ -113,7 +114,13 @@ class DeepThoughtAgent(nn.Module):
             latent_dim=config.encoder.latent_dim,
             context_dim=router_context_dim
         )
-        self.expert_bank = ExpertBank(config.expert, config.router.num_experts, config.encoder.latent_dim)
+        # LEVER 3: Pass expert_hard_cap as max_experts to ExpertBank
+        expert_hard_cap = getattr(config.training, 'expert_hard_cap',
+                                  getattr(config.governance, 'expert_hard_cap', 256))
+        self.expert_bank = ExpertBank(
+            config.expert, config.router.num_experts, config.encoder.latent_dim,
+            max_experts=expert_hard_cap
+        )
         self.world_model = WorldModel(config.world_model, config.action_dim)
 
         # Set observation dim on world model for decoder
@@ -690,6 +697,20 @@ class DeepThoughtAgent(nn.Module):
             )
         losses["compute_loss"] = compute_loss
 
+        # LEVER 5: Capability density reward
+        # Capability Density = mean_expert_utility / total_param_count
+        # This is a REWARD (negative loss) — the system is incentivized to
+        # achieve the same performance with fewer parameters.  This directly
+        # combats the neuron explosion bug where "more neurons = lower error"
+        # was the equilibrium the system found.
+        capability_density = self.expert_bank.capability_density()
+        density_coef = getattr(self.config.training, 'capability_density_coef', 0.01)
+        # Negative because we want to MAXIMIZE density (minimize the loss)
+        losses["capability_density_loss"] = torch.tensor(
+            -density_coef * capability_density,
+            device=batch["observations"].device
+        )
+
         # Encoder losses
         if "encoder_info" in outputs:
             encoder_losses = self.encoder.compute_losses(outputs["encoder_info"])
@@ -941,6 +962,8 @@ class DeepThoughtAgent(nn.Module):
             "num_experts": len(self.expert_bank),
             "active_experts": len(self.expert_bank.get_active_experts()),
             "dormant_experts": len(self.expert_bank.get_dormant_experts()),
+            "capability_density": self.expert_bank.capability_density(),
+            "dormant_cached_experts": len(self.expert_bank.dormant_cache),
             "memory_stats": self.memory.get_memory_stats(),
         }
 

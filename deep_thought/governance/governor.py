@@ -42,8 +42,10 @@ class GovernorConfig:
     entropy_constraint_coef: float = 0.01
     load_balance_constraint_coef: float = 0.01
     world_model_constraint_coef: float = 0.01
-    compute_penalty_constraint_coef: float = 0.001
+    compute_penalty_constraint_coef: float = 0.05  # LEVER 1: Was 0.001
     memory_coherence_constraint_coef: float = 0.01
+    # LEVER 5: Capability density reward coefficient
+    capability_density_coef: float = 0.01
 
     # Asymmetric memory parameters (Fix 5)
     memory_write_cost: float = 0.01       # Cheap writes
@@ -162,6 +164,18 @@ class Governor:
                 constraint_loss = c * val
                 total_loss = total_loss + constraint_loss
                 constraint_weights["compute"] = constraint_loss.item()
+
+        # LEVER 5: Capability density reward
+        # This is expressed as a negative loss (reward), so adding it
+        # REDUCES total loss, incentivizing the system to achieve high
+        # performance with fewer parameters.
+        if "capability_density_loss" in auxiliary_losses:
+            val = auxiliary_losses["capability_density_loss"]
+            if isinstance(val, torch.Tensor):
+                c = getattr(self.config, 'capability_density_coef', 0.01)
+                constraint_loss = c * val
+                total_loss = total_loss + constraint_loss  # val is already negative
+                constraint_weights["capability_density"] = constraint_loss.item()
 
         return total_loss, constraint_weights
 

@@ -128,16 +128,21 @@ class ExpertBank(nn.Module):
     - Utility tracking
     - Lifecycle states (active, dormant, dead)
     - Pruning and growth
+    - LEVER 3: Hard expert cap (max_experts budget)
+    - LEVER 4: Dormant expert offloading (compress to float16, free VRAM)
     
     Uses a mapping dict (expert_id -> position_in_modulelist) to maintain
     consistent indexing even after pruning operations.
     """
     
-    def __init__(self, config: ExpertConfig, num_experts: int = 128, latent_dim: int = 1024):
+    def __init__(self, config: ExpertConfig, num_experts: int = 128, latent_dim: int = 1024,
+                 max_experts: int = 256):
         super().__init__()
         self.config = config
         self.num_experts = num_experts
         self.latent_dim = latent_dim
+        # LEVER 3: Hard cap on total expert count (active + dormant + cached)
+        self.max_experts = max_experts
         
         # Create experts - each expert has a unique ID that persists
         self.experts = nn.ModuleDict({
@@ -148,6 +153,13 @@ class ExpertBank(nn.Module):
         self.expert_stats: Dict[int, ExpertStats] = {
             i: ExpertStats() for i in range(num_experts)
         }
+        
+        # LEVER 4: Dormant cache - stores compressed (float16) weights of
+        # offloaded dormant experts.  When an expert goes dormant, its weights
+        # are quantized to float16 and stored here, then removed from the
+        # ModuleDict to free VRAM.  This means dormant experts contribute
+        # ~zero compute tax instead of sitting in memory unused.
+        self.dormant_cache: Dict[int, Dict[str, torch.Tensor]] = {}
         
         # Utility computation parameters
         self.alpha = 0.3  # Activation weight
@@ -266,12 +278,14 @@ class ExpertBank(nn.Module):
             stats.activation_count = 0
     
     def mark_dormant(self, threshold: float = 0.15):
-        """Mark low-utility experts as dormant."""
+        """Mark low-utility experts as dormant and offload them (LEVER 4)."""
         for exp_id, stats in self.expert_stats.items():
             if stats.utility_score < threshold:
                 if stats.state == ExpertState.ACTIVE:
                     stats.state = ExpertState.DORMANT
                     stats.dormancy_age = 0
+                    # LEVER 4: Offload dormant expert to save VRAM
+                    self._offload_dormant_expert(exp_id)
     
     def mark_dead(self, threshold: float = 0.05, confirmation_steps: int = 1000000):
         """Mark long-dormant experts as dead."""
@@ -283,9 +297,12 @@ class ExpertBank(nn.Module):
                     stats.state = ExpertState.DEAD
     
     def reactivate(self, expert_ids: List[int]):
-        """Reactivate dormant experts."""
+        """Reactivate dormant experts, restoring from cache if needed (LEVER 4)."""
         for exp_id in expert_ids:
             if exp_id in self.expert_stats:
+                # LEVER 4: Check if expert is in dormant cache
+                if exp_id in self.dormant_cache:
+                    self._reactivate_from_cache(exp_id)
                 self.expert_stats[exp_id].state = ExpertState.ACTIVE
                 self.expert_stats[exp_id].dormancy_age = 0
     
@@ -312,29 +329,37 @@ class ExpertBank(nn.Module):
         self,
         parent_id: Optional[int] = None,
         noise_scale: float = 0.01
-    ) -> int:
+    ) -> Optional[int]:
         """
         Grow a new expert.
+        
+        LEVER 3: Enforces hard cap on expert count.  If the total number
+        of experts (active + dormant + cached) is at or above max_experts,
+        growth is refused and None is returned.
         
         Args:
             parent_id: Expert to clone (if None, clone best)
             noise_scale: Noise for initialization
             
         Returns:
-            New expert ID
+            New expert ID, or None if growth is denied by the cap.
         """
+        # LEVER 3: Hard budget check
+        total_experts = len(self.experts) + len(self.dormant_cache)
+        if total_experts >= self.max_experts:
+            return None  # Growth denied - at capacity
+        
         # Find best expert if no parent specified
         if parent_id is None:
-            parent_id = max(
-                self.expert_stats.items(),
-                key=lambda x: x[1].utility_score
-            )[0]
+            active_stats = {k: v for k, v in self.expert_stats.items()
+                            if v.state == ExpertState.ACTIVE}
+            if not active_stats:
+                return None  # No active experts to clone from
+            parent_id = max(active_stats.items(), key=lambda x: x[1].utility_score)[0]
         
         # Generate new unique ID
-        if self.expert_stats:
-            new_id = max(self.expert_stats.keys()) + 1
-        else:
-            new_id = 0
+        all_ids = set(self.expert_stats.keys())
+        new_id = max(all_ids) + 1 if all_ids else 0
         
         # Clone parent
         parent_expert = self._get_expert(parent_id)
@@ -415,5 +440,81 @@ class ExpertBank(nn.Module):
         self.expert_stats[expert_id2].state = ExpertState.DEAD
     
     def __len__(self):
-        """Return number of experts."""
-        return len(self.experts)
+        """Return total number of experts (active + cached)."""
+        return len(self.experts) + len(self.dormant_cache)
+    
+    # ----------------------------------------------------------------
+    # LEVER 3: Capability Density metric
+    # ----------------------------------------------------------------
+    def capability_density(self) -> float:
+        """Compute capability density = mean_utility / total_param_count.
+        
+        This metric rewards the system for being efficient — high performance
+        with few parameters.  A low density means the model is wasting capacity
+        on experts that aren't contributing proportionally to their cost.
+        
+        Returns:
+            Capability density (higher is better).
+        """
+        active_experts = self.get_active_experts()
+        if not active_experts:
+            return 0.0
+        mean_utility = sum(
+            self.expert_stats[eid].utility_score for eid in active_experts
+        ) / len(active_experts)
+        total_params = sum(
+            sum(p.numel() for p in self.experts[str(eid)].parameters())
+            for eid in active_experts
+            if str(eid) in self.experts
+        )
+        if total_params == 0:
+            return 0.0
+        return mean_utility / (total_params / 1e6)  # Normalize to millions of params
+    
+    # ----------------------------------------------------------------
+    # LEVER 4: Dormant expert offloading / compression
+    # ----------------------------------------------------------------
+    def _offload_dormant_expert(self, expert_id: int):
+        """Compress a dormant expert's weights to float16 and offload from VRAM.
+        
+        Instead of keeping dormant experts in the ModuleDict where they
+        consume VRAM and incur a compute tax, this method:
+        1. Extracts all weight tensors
+        2. Compresses them to float16 (2x memory savings)
+        3. Stores them in dormant_cache (a plain dict, not a ModuleDict)
+        4. Removes the expert from self.experts ModuleDict
+        
+        The expert can be restored later via _reactivate_from_cache().
+        """
+        key = str(expert_id)
+        if key not in self.experts:
+            return  # Already offloaded or doesn't exist
+        
+        expert = self.experts[key]
+        compressed = {}
+        with torch.no_grad():
+            for name, param in expert.named_parameters():
+                compressed[name] = param.data.cpu().half()  # float16 compression
+        
+        self.dormant_cache[expert_id] = compressed
+        del self.experts[key]  # Remove from ModuleDict to free VRAM
+    
+    def _reactivate_from_cache(self, expert_id: int):
+        """Restore a cached dormant expert from float16 back to float32.
+        
+        Decompresses the expert's weights and adds it back to the
+        ModuleDict so it can participate in forward passes again.
+        """
+        if expert_id not in self.dormant_cache:
+            return  # Not in cache
+        
+        compressed = self.dormant_cache.pop(expert_id)
+        
+        # Create a fresh expert and restore weights
+        expert = Expert(self.config, expert_id, self.latent_dim)
+        with torch.no_grad():
+            for name, param in expert.named_parameters():
+                if name in compressed:
+                    param.data = compressed[name].float().to(param.device)
+        
+        self.experts[str(expert_id)] = expert

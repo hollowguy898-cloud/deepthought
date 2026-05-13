@@ -55,6 +55,12 @@ class SelfRegressionPrevention(nn.Module):
         
         # Memory contamination tracking
         self.memory_usefulness: Dict[int, float] = {}
+        
+        # LEVER 5: Neuron explosion detection
+        # Track expert count over time to detect parameter bloat
+        self._expert_count_history = []
+        self._neuron_explosion_detected = False
+        self._expert_count_growth_threshold = 1.5  # Flag if count grows >50% without reward improvement
     
     def update(
         self,
@@ -81,6 +87,10 @@ class SelfRegressionPrevention(nn.Module):
         # Check for regression
         is_regressing = self.monitor.check_regression(self.config.drift_threshold)
         
+        # LEVER 5: Detect neuron explosion (parameter bloat without reward improvement)
+        if expert_utilities is not None:
+            self._check_neuron_explosion(len(expert_utilities), reward)
+        
         # Update architecture gate
         self._update_architecture_gate(is_regressing)
         
@@ -91,13 +101,50 @@ class SelfRegressionPrevention(nn.Module):
         signals = {
             "is_regressing": is_regressing,
             "allow_pruning": self.allow_pruning,
-            "allow_growth": self.allow_growth,
+            "allow_growth": self.allow_growth and not self._neuron_explosion_detected,
             "allow_routing_changes": self.allow_routing_changes,
             "routing_ok": routing_ok,
             "should_rollback": is_regressing and self.config.rollback_on_regression,
+            "neuron_explosion_detected": self._neuron_explosion_detected,
         }
         
         return signals
+    
+    def _check_neuron_explosion(self, current_expert_count: int, current_reward: float):
+        """LEVER 5: Detect neuron explosion pattern.
+        
+        Neuron explosion = expert count growing significantly while
+        reward is NOT improving proportionally.  This catches the
+        "more neurons = faster adaptation" spiral early.
+        """
+        self._expert_count_history.append((current_expert_count, current_reward))
+        
+        # Keep only recent history
+        if len(self._expert_count_history) > 100:
+            self._expert_count_history = self._expert_count_history[-100:]
+        
+        if len(self._expert_count_history) < 20:
+            self._neuron_explosion_detected = False
+            return
+        
+        # Compare recent vs early expert counts
+        early_count = sum(c for c, _ in self._expert_count_history[:10]) / 10
+        recent_count = sum(c for c, _ in self._expert_count_history[-10:]) / 10
+        early_reward = sum(r for _, r in self._expert_count_history[:10]) / 10
+        recent_reward = sum(r for _, r in self._expert_count_history[-10:]) / 10
+        
+        # Neuron explosion: expert count grew >threshold but reward didn't improve proportionally
+        if early_count > 0:
+            count_ratio = recent_count / early_count
+            reward_ratio = (recent_reward - early_reward) / (abs(early_reward) + 1e-8)
+            
+            # If expert count grew >50% but reward improvement < 10% of that growth
+            self._neuron_explosion_detected = (
+                count_ratio > self._expert_count_growth_threshold and
+                reward_ratio < count_ratio * 0.1
+            )
+        else:
+            self._neuron_explosion_detected = False
     
     def _update_architecture_gate(self, is_regressing: bool):
         """Update architecture change gate based on stability."""
@@ -307,6 +354,7 @@ class SelfRegressionPrevention(nn.Module):
                 "allow_routing_changes": self.allow_routing_changes,
             },
             "num_unhealthy_experts": len(self.isolate_unhealthy_experts()),
+            "neuron_explosion_detected": self._neuron_explosion_detected,
         }
     
     def reset(self):
@@ -321,3 +369,6 @@ class SelfRegressionPrevention(nn.Module):
         self.allow_routing_changes = True
         self.expert_health = {}
         self.memory_usefulness = {}
+        # LEVER 5: Reset neuron explosion detection
+        self._expert_count_history = []
+        self._neuron_explosion_detected = False

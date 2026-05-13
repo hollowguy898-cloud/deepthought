@@ -387,15 +387,24 @@ class GovernanceConfig:
     min_experts: int = 4
     pruning_confirmation_window: int = 10_000
     growth_marginal_threshold: float = 0.1
-    pruning_utility_threshold: float = 0.05
-    redundancy_threshold: float = 0.9
+    # LEVER 2: Pruning triggers sooner with higher utility threshold
+    pruning_utility_threshold: float = 0.08  # Was 0.05 -- prune low-value experts
+    # LEVER 2: Detect redundancy sooner
+    redundancy_threshold: float = 0.85      # Was 0.9 -- detect redundancy sooner
     # Constraint coefficients (Fix 1: auxiliary losses are constraints)
     sparsity_constraint_coef: float = 0.01
     entropy_constraint_coef: float = 0.01
     load_balance_constraint_coef: float = 0.01
     world_model_constraint_coef: float = 0.5
-    compute_penalty_constraint_coef: float = 0.001
+    # LEVER 1: Tightened compute penalty to prevent neuron explosion.
+    # The old value (0.001) was far too permissive -- experts learned that
+    # adding parameters was an easy shortcut to lower error, causing bloat.
+    compute_penalty_constraint_coef: float = 0.05  # Was 0.001 -- 50x increase
     memory_coherence_constraint_coef: float = 0.01
+    # LEVER 3: Expert hard cap (overrides max_experts for growth)
+    expert_hard_cap: int = 64
+    # LEVER 5: Capability density reward coefficient
+    capability_density_coef: float = 0.01
     # Asymmetric memory (Fix 5)
     memory_read_filter_threshold: float = 0.3
     memory_influence_on_pruning: bool = False
@@ -420,16 +429,41 @@ class TrainingConfig:
     
     # World model loss coefficients
     world_model_loss_coef: float = 0.5
-    compute_penalty_coef: float = 0.001
+    # LEVER 1: Tightened compute penalty in training config too.
+    compute_penalty_coef: float = 0.05  # Was 0.001 -- matches governance coef
     
     # Pruning and growth
-    prune_interval: int = 10000
-    growth_interval: int = 5000
+    # LEVER 2: Aggressive synaptic pruning thresholds.
+    # Old values were far too lenient -- the model could accumulate
+    # millions of dead parameters before cleanup.  The system should
+    # be "impatient": if a neuron isn't contributing significantly,
+    # it should be deleted quickly.
+    prune_interval: int = 5000           # Was 10000 -- prune twice as often
+    growth_interval: int = 10000         # Was 5000 -- grow half as often
     utility_ema_alpha: float = 0.99
-    dormant_threshold: float = 0.15
-    delete_threshold: float = 0.05
-    dormant_confirmation_steps: int = 100000
-    delete_confirmation_steps: int = 1000000
+    dormant_threshold: float = 0.25      # Was 0.15 -- mark dormant sooner
+    delete_threshold: float = 0.10       # Was 0.05 -- delete sooner
+    dormant_confirmation_steps: int = 10000   # Was 100000 -- 10x faster
+    delete_confirmation_steps: int = 50000    # Was 1000000 -- 20x faster
+    
+    # NEURON EXPLOSION FIX: Hard expert cap budget
+    # Maximum total experts that can ever exist. Growth beyond this is
+    # absolutely forbidden regardless of predicted marginal contribution.
+    expert_hard_cap: int = 64
+    
+    # NEURON EXPLOSION FIX: Capability density reward coefficient
+    # Capability Density = performance / parameter_count
+    # The system should REWARD achieving the same performance with fewer params.
+    capability_density_coef: float = 0.01
+    
+    # NEURON EXPLOSION FIX: Dormancy offloading
+    # After this many steps dormant, compress expert weights to save memory.
+    dormancy_offload_steps: int = 20000
+    
+    # NEURON EXPLOSION FIX: Fast weight SRP constraint
+    # Fast weight norm is constrained proportional to 1/sqrt(num_active_experts)
+    # This prevents "more neurons = faster adaptation" spiral (Lamarckian problem).
+    fast_weight_norm_per_expert_budget: float = 2.0
 
 
 @dataclass

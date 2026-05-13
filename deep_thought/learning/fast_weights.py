@@ -3,12 +3,21 @@ Fast weight memory for Deep Thought.
 
 Implements Hebbian-style fast weights for rapid adaptation
 without corrupting long-term knowledge.
+
+LEVER 5 (Lamarckian Fix): Fast Adaptation + Hebbian learning without
+strict SRP leads to "more neurons = faster adaptation" spiral.  The fix
+is to constrain the fast weight norm INVERSELY PROPORTIONAL to the
+number of active experts, so that adding more experts does NOT give
+the fast weight system more adaptation budget.  This breaks the
+Lamarckian spiral where the system discovers that more experts means
+faster Hebbian adaptation, leading to neuron explosion.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+import math
 
 from deep_thought.config import MetaLearningConfig
 
@@ -22,13 +31,26 @@ class FastWeightMemory(nn.Module):
     
     Creates temporary associations that decay over time,
     allowing rapid adaptation without permanent corruption.
+    
+    LEVER 5: The max norm for fast weights is dynamically scaled as:
+        max_norm = base_budget / sqrt(num_active_experts)
+    This ensures that adding more experts does NOT increase the total
+    fast weight adaptation budget.  Without this constraint, the system
+    discovers a "Lamarckian" shortcut: more experts -> more Hebbian
+    connections -> faster short-term adaptation -> even more growth.
     """
     
-    def __init__(self, config: MetaLearningConfig, latent_dim: int = 1024):
+    def __init__(self, config: MetaLearningConfig, latent_dim: int = 1024,
+                 num_active_experts: int = 4):
         super().__init__()
         self.config = config
         self.latent_dim = latent_dim
         self.fast_weight_dim = config.fast_weight_dim
+        
+        # LEVER 5: Track number of active experts for norm scaling
+        self._num_active_experts = max(1, num_active_experts)
+        # Base budget per expert — total budget is this * sqrt(num_experts)
+        self._per_expert_budget = getattr(config, 'fast_weight_norm_per_expert_budget', 2.0)
         
         # Fast weight matrix
         self.fast_weights = nn.Parameter(
@@ -47,6 +69,28 @@ class FastWeightMemory(nn.Module):
         
         # Projection for Hebbian update (latent_dim -> fast_weight_dim)
         self.hebbian_proj = nn.Linear(latent_dim, self.fast_weight_dim, bias=False)
+    
+    def set_num_active_experts(self, num: int):
+        """Update the number of active experts for LEVER 5 norm scaling.
+        
+        Called by the agent when the expert count changes (pruning/growth).
+        """
+        self._num_active_experts = max(1, num)
+    
+    def _get_max_norm(self) -> float:
+        """Compute the dynamic max norm for fast weights (LEVER 5).
+        
+        The total adaptation budget is FIXED regardless of how many
+        experts exist.  More experts = less budget per expert.
+        
+        max_norm = per_expert_budget * sqrt(num_active_experts)
+        
+        This means the TOTAL fast weight norm across all experts grows
+        only as sqrt(N), not linearly with N.  Without this, the system
+        finds that adding N experts gives N times more Hebbian capacity,
+        leading to the neuron explosion spiral.
+        """
+        return self._per_expert_budget * math.sqrt(self._num_active_experts)
     
     def forward(
         self,
@@ -86,6 +130,10 @@ class FastWeightMemory(nn.Module):
                     self.decay * self.fast_weights.data +
                     (1 - self.decay) * hebbian_update
                 )
+                
+                # LEVER 5: Strict SRP — constrain fast weight norm
+                # proportional to 1/sqrt(num_active_experts)
+                self.constrain_norm(self._get_max_norm())
         
         return h_fast, fast_contribution
     
@@ -99,7 +147,11 @@ class FastWeightMemory(nn.Module):
         return self.fast_weights.norm().item()
     
     def constrain_norm(self, max_norm: float = 10.0):
-        """Constrain fast weight norm to prevent explosion."""
+        """Constrain fast weight norm to prevent explosion.
+        
+        LEVER 5: By default, this now uses the dynamic max norm
+        that scales inversely with the number of active experts.
+        """
         current_norm = self.fast_weights.norm()
         if current_norm > max_norm:
             with torch.no_grad():
