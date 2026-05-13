@@ -15,6 +15,7 @@ class EncoderConfig:
     num_layers: int = 2
     activation: str = "silu"
     use_layer_norm: bool = True
+    observation_dim: Optional[int] = None
 
 
 @dataclass
@@ -72,7 +73,7 @@ class WorldModelConfig:
     use_world_model: bool = True
     latent_dim: int = 1024
     hidden_dim: int = 2048
-    action_dim: int = None
+    action_dim: Optional[int] = None
     predict_reward: bool = True
     predict_done: bool = True
     prediction_horizon: int = 5
@@ -196,10 +197,10 @@ class DeepThoughtConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     
     # Environment
-    observation_dim: int = None
-    action_dim: int = None
+    observation_dim: Optional[int] = None
+    action_dim: Optional[int] = None
     action_space: str = "discrete"  # discrete, continuous
-    num_actions: int = None
+    num_actions: Optional[int] = None
     
     # Device
     device: str = "cuda"
@@ -216,9 +217,42 @@ class DeepThoughtConfig:
         """Load configuration from YAML file."""
         with open(path, "r") as f:
             data = yaml.safe_load(f)
-        return cls(**data)
+        
+        if data is None:
+            return cls()
+        
+        # Handle nested dataclasses properly
+        nested_configs = {
+            "encoder": EncoderConfig,
+            "router": RouterConfig,
+            "expert": ExpertConfig,
+            "memory": MemoryConfig,
+            "world_model": WorldModelConfig,
+            "feature_validation": FeatureValidationConfig,
+            "expert_compiler": ExpertCompilerConfig,
+            "planning": PlanningConfig,
+            "meta_learning": MetaLearningConfig,
+            "srp": SRPConfig,
+            "training": TrainingConfig,
+        }
+        
+        config = cls()
+        for key, value in data.items():
+            if key in nested_configs and isinstance(value, dict):
+                # Filter out keys that don't belong to the nested config
+                valid_keys = {f.name for f in nested_configs[key].__dataclass_fields__.values()}
+                filtered_value = {k: v for k, v in value.items() if k in valid_keys}
+                nested_obj = nested_configs[key](**filtered_value)
+                setattr(config, key, nested_obj)
+            elif hasattr(config, key):
+                setattr(config, key, value)
+        
+        return config
     
     def to_yaml(self, path: str):
         """Save configuration to YAML file."""
+        # Convert nested dataclasses to dicts for YAML serialization
+        from dataclasses import asdict
+        data = asdict(self)
         with open(path, "w") as f:
-            yaml.dump(self.__dict__, f, default_flow_style=False)
+            yaml.dump(data, f, default_flow_style=False)

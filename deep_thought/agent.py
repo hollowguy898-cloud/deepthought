@@ -50,9 +50,20 @@ class DeepThoughtAgent(nn.Module):
         
         # Core architecture
         self.encoder = Encoder(config.encoder)
-        self.router = SparseRouter(config.router, use_adaptive=True)
-        self.expert_bank = ExpertBank(config.expert, config.router.num_experts)
+        # Router uses meta_learning context_dim if available
+        router_context_dim = config.meta_learning.context_dim if config.meta_learning.use_meta_learning else 256
+        self.router = SparseRouter(
+            config.router,
+            use_adaptive=True,
+            latent_dim=config.encoder.latent_dim,
+            context_dim=router_context_dim
+        )
+        self.expert_bank = ExpertBank(config.expert, config.router.num_experts, config.encoder.latent_dim)
         self.world_model = WorldModel(config.world_model, config.action_dim)
+        
+        # Set observation dim on world model for decoder
+        if config.observation_dim is not None:
+            self.world_model.set_observation_dim(config.observation_dim)
         
         # Memory system
         self.memory = MemorySystem(config.memory, config.encoder.latent_dim)
@@ -99,7 +110,12 @@ class DeepThoughtAgent(nn.Module):
             self.srp = None
         
         # Policy and value heads
-        self.policy_head = nn.Linear(config.encoder.latent_dim, config.num_actions)
+        # For continuous action space, policy head outputs mean + log_std (2 * action_dim)
+        if config.action_space == "continuous" and config.action_dim is not None:
+            policy_dim = config.action_dim * 2
+        else:
+            policy_dim = config.num_actions if config.num_actions is not None else config.action_dim or 2
+        self.policy_head = nn.Linear(config.encoder.latent_dim, policy_dim)
         self.critic_head = nn.Linear(config.encoder.latent_dim, 1)
         
         # Initialize hidden state
@@ -115,7 +131,11 @@ class DeepThoughtAgent(nn.Module):
         device = next(self.parameters()).device
         self.h_t = self.memory.reset_working_memory(batch_size, device)
         self.m_t = torch.zeros(batch_size, self.config.encoder.latent_dim, device=device)
-        self.context = torch.zeros(batch_size, self.config.meta_learning.context_dim, device=device)
+        
+        if self.meta_learning is not None:
+            self.context = torch.zeros(batch_size, self.config.meta_learning.context_dim, device=device)
+        else:
+            self.context = None
         
         if self.planning is not None:
             self.planning.reset_plan()
@@ -154,11 +174,30 @@ class DeepThoughtAgent(nn.Module):
         if self.h_t is None:
             self.reset(observation.size(0))
         
+        # Safe default action tensor
+        if action is not None:
+            # Convert action to proper format for internal use
+            if self.config.action_space == "discrete":
+                # One-hot encode discrete actions
+                if action.dim() == 0:
+                    action = action.unsqueeze(0)
+                batch_size = action.size(0)
+                action_input = torch.zeros(batch_size, self.config.action_dim, device=observation.device)
+                action_input.scatter_(1, action.unsqueeze(1), 1.0)
+            else:
+                # Continuous actions - ensure 2D
+                if action.dim() == 1:
+                    action_input = action.unsqueeze(0)
+                else:
+                    action_input = action
+        else:
+            action_input = torch.zeros(observation.size(0), self.config.action_dim, device=observation.device)
+        
         h_t, memory_info = self.memory(
             self.h_t,
             x_t,
             observation,
-            action if action is not None else torch.zeros_like(observation[:, :self.config.action_dim]),
+            action_input,
             reward if reward is not None else 0.0,
             done if done is not None else False,
             write=training
@@ -169,13 +208,13 @@ class DeepThoughtAgent(nn.Module):
         # Get prediction error for adaptation
         if action is not None and self.world_model is not None:
             with torch.no_grad():
-                z_next_pred, _, _ = self.world_model(x_t, action)
-                prediction_error = F.mse_loss(z_next_pred, x_t)
+                z_next_pred, _, _ = self.world_model(x_t, action_input)
+                prediction_error = F.mse_loss(z_next_pred, x_t.detach())
         else:
-            prediction_error = torch.tensor(0.0)
+            prediction_error = torch.tensor(0.0, device=observation.device)
         
         # Update context
-        if self.meta_learning is not None:
+        if self.meta_learning is not None and self.context is not None:
             self.context = self.meta_learning.update_context(x_t)
         
         # Route to experts
@@ -202,7 +241,7 @@ class DeepThoughtAgent(nn.Module):
         outputs["compute_costs"] = compute_costs
         
         # Meta-learning adaptation
-        if self.meta_learning is not None:
+        if self.meta_learning is not None and self.context is not None:
             h_adapted, meta_info = self.meta_learning.adapt(
                 h_tilde,
                 self.context,
@@ -232,7 +271,7 @@ class DeepThoughtAgent(nn.Module):
         
         # World model prediction
         if self.world_model is not None and action is not None:
-            z_next, r_pred, d_pred = self.world_model(x_t, action)
+            z_next, r_pred, d_pred = self.world_model(x_t, action_input)
             outputs["world_model"] = {
                 "z_next": z_next,
                 "r_pred": r_pred,
@@ -280,8 +319,11 @@ class DeepThoughtAgent(nn.Module):
                     action = torch.distributions.Categorical(action_probs).sample()
             else:
                 # Continuous
-                mean = policy_logits[:, :self.config.action_dim]
-                log_std = policy_logits[:, self.config.action_dim:]
+                action_dim = self.config.action_dim
+                mean = policy_logits[:, :action_dim]
+                log_std = policy_logits[:, action_dim:]
+                # Clamp log_std for numerical stability
+                log_std = torch.clamp(log_std, -20, 2)
                 std = torch.exp(log_std)
                 dist = torch.distributions.Normal(mean, std)
                 if deterministic:
@@ -321,8 +363,10 @@ class DeepThoughtAgent(nn.Module):
             dist = torch.distributions.Categorical(action_probs)
             log_probs = dist.log_prob(batch["actions"])
         else:
-            mean = outputs["policy_logits"][:, :self.config.action_dim]
-            log_std = outputs["policy_logits"][:, self.config.action_dim:]
+            action_dim = self.config.action_dim
+            mean = outputs["policy_logits"][:, :action_dim]
+            log_std = outputs["policy_logits"][:, action_dim:]
+            log_std = torch.clamp(log_std, -20, 2)
             std = torch.exp(log_std)
             dist = torch.distributions.Normal(mean, std)
             log_probs = dist.log_prob(batch["actions"]).sum(dim=-1)
@@ -357,7 +401,7 @@ class DeepThoughtAgent(nn.Module):
             losses.update(wm_losses)
         
         # Compute penalty
-        compute_loss = 0.0
+        compute_loss = torch.tensor(0.0, device=batch["observations"].device)
         if "compute_costs" in outputs:
             from deep_thought.optimization.losses import compute_compute_penalty
             compute_loss = compute_compute_penalty(
@@ -411,7 +455,7 @@ class DeepThoughtAgent(nn.Module):
             if signals["architecture_gate"]["allow_growth"]:
                 # Check if growth is needed (e.g., stagnation)
                 # For now, grow if under max
-                if len(self.expert_bank.experts) < self.config.expert_compiler.max_experts:
+                if len(self.expert_bank) < self.config.expert_compiler.max_experts:
                     self.expert_bank.grow_expert()
     
     def consolidate_memory(self):
@@ -463,7 +507,7 @@ class DeepThoughtAgent(nn.Module):
         """Get comprehensive statistics."""
         stats = {
             "step": self.step,
-            "num_experts": len(self.expert_bank.experts),
+            "num_experts": len(self.expert_bank),
             "active_experts": len(self.expert_bank.get_active_experts()),
             "dormant_experts": len(self.expert_bank.get_dormant_experts()),
             "memory_stats": self.memory.get_memory_stats(),

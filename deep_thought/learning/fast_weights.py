@@ -42,8 +42,11 @@ class FastWeightMemory(nn.Module):
         # Decay rate
         self.decay = config.fast_weight_decay
         
-        # Projection for fast weight computation
-        self.proj = nn.Linear(latent_dim, self.fast_weight_dim, bias=False)
+        # Projection for fast weight computation (fast_weight_dim -> latent_dim)
+        self.proj = nn.Linear(self.fast_weight_dim, latent_dim, bias=False)
+        
+        # Projection for Hebbian update (latent_dim -> fast_weight_dim)
+        self.hebbian_proj = nn.Linear(latent_dim, self.fast_weight_dim, bias=False)
     
     def forward(
         self,
@@ -70,10 +73,12 @@ class FastWeightMemory(nn.Module):
         # Update fast weights using Hebbian rule
         if update:
             with torch.no_grad():
-                # Hebbian update: ΔW = η * h * h^T
+                # Hebbian update: ΔW = η * proj(h) ⊗ h
+                # Shape: [fast_weight_dim] ⊗ [latent_dim] = [latent_dim, fast_weight_dim]
+                projected = self.hebbian_proj(h_t)  # [B, fast_weight_dim]
                 hebbian_update = self.fast_lr * torch.matmul(
                     h_t.T,
-                    h_t
+                    projected
                 ) / h_t.size(0)
                 
                 # Apply update with decay

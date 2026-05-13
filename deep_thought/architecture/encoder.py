@@ -56,6 +56,7 @@ class FactorizedLatent(nn.Module):
         self.latent_dim = latent_dim
         self.num_subspaces = num_subspaces
         self.subspace_dim = latent_dim // num_subspaces
+        self.output_dim = self.subspace_dim * num_subspaces  # May be < latent_dim if not evenly divisible
         
         # Subspace projections
         self.projections = nn.ModuleList([
@@ -68,6 +69,12 @@ class FactorizedLatent(nn.Module):
             "orthogonality_target",
             torch.eye(num_subspaces)
         )
+        
+        # Project back to full latent_dim if needed
+        if self.output_dim != latent_dim:
+            self.output_proj = nn.Linear(self.output_dim, latent_dim, bias=False)
+        else:
+            self.output_proj = None
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -82,6 +89,11 @@ class FactorizedLatent(nn.Module):
             subspaces.append(proj(x))
         
         h = torch.cat(subspaces, dim=-1)
+        
+        # Project back to latent_dim if dimensions don't match
+        if self.output_proj is not None:
+            h = self.output_proj(h)
+        
         return h, tuple(subspaces)
     
     def orthogonality_loss(self, subspaces: Tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -147,7 +159,13 @@ class Encoder(nn.Module):
         self.latent_dim = config.latent_dim
         self.num_subspaces = 5
         
-        # Input projection
+        # Input projection - observation_dim must be set before creating encoder
+        if config.observation_dim is None:
+            raise ValueError(
+                "EncoderConfig.observation_dim must be set before creating Encoder. "
+                "Set it via config.encoder.observation_dim = env.observation_space.shape[0]"
+            )
+        
         layers = []
         input_dim = config.observation_dim
         
@@ -158,7 +176,7 @@ class Encoder(nn.Module):
             elif config.activation == "relu":
                 layers.append(nn.ReLU())
             elif config.activation == "gelu":
-                layers.append(nn.GELU()
+                layers.append(nn.GELU())
             else:
                 layers.append(nn.SiLU())
             
@@ -168,6 +186,12 @@ class Encoder(nn.Module):
             input_dim = config.hidden_dim
         
         self.encoder = nn.Sequential(*layers)
+        
+        # Project from hidden_dim to latent_dim if they differ
+        if config.hidden_dim != config.latent_dim:
+            self.hidden_to_latent = nn.Linear(config.hidden_dim, config.latent_dim)
+        else:
+            self.hidden_to_latent = nn.Identity()
         
         # Factorized latent
         self.factorized = FactorizedLatent(
@@ -197,6 +221,9 @@ class Encoder(nn.Module):
         """
         # Initial encoding
         h = self.encoder(observation)
+        
+        # Project to latent dim
+        h = self.hidden_to_latent(h)
         
         # Factorized subspaces
         h_factorized, subspaces = self.factorized(h)

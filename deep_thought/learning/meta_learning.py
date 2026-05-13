@@ -111,10 +111,15 @@ class MetaLearningLayer(nn.Module):
             latent: Current latent state
             
         Returns:
-            context: Current context embedding
+            context: Current context embedding (batch_size, context_dim)
         """
-        # Add to buffer
-        self.trajectory_buffer.append(latent.detach())
+        batch_size = latent.size(0)
+        
+        # Add to buffer - store only first element if batched
+        if batch_size > 1:
+            self.trajectory_buffer.append(latent[0:1].detach())
+        else:
+            self.trajectory_buffer.append(latent.detach())
         
         # Keep buffer bounded
         if len(self.trajectory_buffer) > self.buffer_size:
@@ -124,10 +129,13 @@ class MetaLearningLayer(nn.Module):
         if len(self.trajectory_buffer) >= 10:
             trajectory = torch.stack(self.trajectory_buffer[-10:], dim=1)
             context = self.context_encoder(trajectory)
+            # Expand to match original batch size
+            if batch_size > 1:
+                context = context.expand(batch_size, -1)
         else:
             # Default context
             device = latent.device
-            context = torch.zeros(1, self.config.context_dim, device=device)
+            context = torch.zeros(batch_size, self.config.context_dim, device=device)
         
         return context
     

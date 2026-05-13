@@ -13,8 +13,8 @@ from deep_thought.config import PlanningConfig
 
 
 @dataclass
-class Plan:
-    """A plan with expert sequence."""
+class StoredPlan:
+    """A stored plan with expert sequence."""
     expert_sequence: List[int]
     duration: List[int]
     reward: float
@@ -41,7 +41,7 @@ class PlanMemory(nn.Module):
         self.latent_dim = latent_dim
         
         self.capacity = config.plan_memory_size
-        self.plans: List[Plan] = []
+        self.plans: List[StoredPlan] = []
     
     def store_plan(
         self,
@@ -61,7 +61,7 @@ class PlanMemory(nn.Module):
             success: Whether plan succeeded
             context_hash: Hash of context for similarity
         """
-        plan = Plan(
+        plan = StoredPlan(
             expert_sequence=expert_sequence,
             duration=duration,
             reward=reward,
@@ -79,7 +79,7 @@ class PlanMemory(nn.Module):
         self,
         context_hash: int,
         k: int = 5
-    ) -> List[Plan]:
+    ) -> List[StoredPlan]:
         """
         Retrieve similar plans.
         
@@ -104,7 +104,7 @@ class PlanMemory(nn.Module):
         
         return similar[:k]
     
-    def get_successful_plans(self) -> List[Plan]:
+    def get_successful_plans(self) -> List[StoredPlan]:
         """Get all successful plans."""
         return [p for p in self.plans if p.success]
     

@@ -85,8 +85,14 @@ class EpisodicMemory(nn.Module):
             Importance score
         """
         with torch.no_grad():
+            # Handle batch dimension - use mean across batch
+            if latent.dim() > 1:
+                latent_flat = latent.mean(dim=0)
+            else:
+                latent_flat = latent
+            
             features = torch.cat([
-                latent.mean(dim=0),
+                latent_flat,
                 torch.tensor([reward, prediction_error, novelty], device=latent.device)
             ])
             importance = self.importance_net(features).item()
@@ -123,15 +129,30 @@ class EpisodicMemory(nn.Module):
         if importance < self.config.importance_threshold:
             return
         
-        # Create entry
-        key = self.key_proj(latent.detach()).squeeze(0)
-        value = self.value_proj(latent.detach()).squeeze(0)
+        # Create entry - handle batch dimension gracefully
+        with torch.no_grad():
+            key = self.key_proj(latent.detach())
+            value = self.value_proj(latent.detach())
+            
+            # Squeeze batch dimension if present
+            if key.dim() > 1 and key.size(0) == 1:
+                key = key.squeeze(0)
+            if value.dim() > 1 and value.size(0) == 1:
+                value = value.squeeze(0)
+            
+            obs_detached = observation.detach()
+            if obs_detached.dim() > 1 and obs_detached.size(0) == 1:
+                obs_detached = obs_detached.squeeze(0)
+            
+            act_detached = action.detach()
+            if act_detached.dim() > 1 and act_detached.size(0) == 1:
+                act_detached = act_detached.squeeze(0)
         
         entry = MemoryEntry(
             key=key,
             value=value,
-            observation=observation.detach().squeeze(0),
-            action=action.detach().squeeze(0),
+            observation=obs_detached,
+            action=act_detached,
             reward=reward,
             done=done,
             importance=importance,
@@ -162,16 +183,23 @@ class EpisodicMemory(nn.Module):
         """
         if len(self.buffer) == 0:
             device = query.device
-            return torch.zeros(1, self.latent_dim, device=device), []
+            batch_size = query.size(0)
+            return torch.zeros(batch_size, self.latent_dim, device=device), []
         
-        # Compute query
-        q = self.query_proj(query).squeeze(0)
+        # Compute query - handle batch dimension
+        with torch.no_grad():
+            q = self.query_proj(query)
+            # Use first element for similarity search if batched
+            if q.dim() > 1:
+                q_search = q[0]
+            else:
+                q_search = q
         
         # Compute similarities
         similarities = []
         for entry in self.buffer:
             sim = F.cosine_similarity(
-                q.unsqueeze(0),
+                q_search.unsqueeze(0),
                 entry.key.unsqueeze(0),
                 dim=-1
             ).item()
@@ -188,11 +216,24 @@ class EpisodicMemory(nn.Module):
         
         # Compute attention weights
         similarities_k = [similarities[i] for i in top_k_indices]
-        attention = F.softmax(torch.tensor(similarities_k), dim=0)
+        attention = F.softmax(torch.tensor(similarities_k, dtype=torch.float32), dim=0)
         
         # Aggregate values
         values = torch.stack([entry.value for entry in entries])
         memory_read = (attention.unsqueeze(-1) * values).sum(dim=0, keepdim=True)
+        
+        # Expand to match batch dimension
+        batch_size = query.size(0)
+        memory_read = memory_read.expand(batch_size, -1)
+        
+        # If value dim != latent_dim, we need a projection (handled by memory_system fusion)
+        # For now, pad or truncate to latent_dim
+        if memory_read.size(-1) != self.latent_dim:
+            if memory_read.size(-1) < self.latent_dim:
+                padding = torch.zeros(batch_size, self.latent_dim - memory_read.size(-1), device=query.device)
+                memory_read = torch.cat([memory_read, padding], dim=-1)
+            else:
+                memory_read = memory_read[:, :self.latent_dim]
         
         # Update retrieval counts
         for idx in top_k_indices:
@@ -229,8 +270,10 @@ class EpisodicMemory(nn.Module):
         ]
         
         for entry in candidates:
-            # Add to semantic memory
-            semantic_memory.write(entry.value, entry.observation)
+            # Add to semantic memory - unsqueeze to add batch dim
+            value_input = entry.value.unsqueeze(0) if entry.value.dim() == 1 else entry.value
+            obs_input = entry.observation.unsqueeze(0) if entry.observation.dim() == 1 else entry.observation
+            semantic_memory.write(value_input, obs_input)
         
         # Remove consolidated entries
         self.buffer = [

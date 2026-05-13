@@ -41,10 +41,14 @@ class RolloutBuffer:
         """Add a timestep to buffer."""
         self.observations.append(observation)
         self.actions.append(action)
-        self.rewards.append(reward)
-        self.dones.append(done)
+        self.rewards.append(float(reward))
+        self.dones.append(float(done))
         self.log_probs.append(log_prob)
-        self.values.append(value)
+        # Store value as scalar for consistent advantage computation
+        if isinstance(value, torch.Tensor):
+            self.values.append(value.item())
+        else:
+            self.values.append(float(value))
         self.latents.append(latent)
         self.memory_reads.append(memory_read)
     
@@ -64,10 +68,10 @@ class RolloutBuffer:
         return {
             "observations": torch.stack(self.observations),
             "actions": torch.stack(self.actions),
-            "rewards": torch.tensor(self.rewards),
-            "dones": torch.tensor(self.dones),
+            "rewards": torch.tensor(self.rewards, dtype=torch.float32),
+            "dones": torch.tensor(self.dones, dtype=torch.float32),
             "log_probs": torch.stack(self.log_probs),
-            "values": torch.stack(self.values),
+            "values": torch.tensor(self.values, dtype=torch.float32),
             "latents": torch.stack(self.latents),
             "memory_reads": torch.stack(self.memory_reads),
         }
@@ -87,9 +91,12 @@ class PPOTrainer:
     - Multiple epochs per update
     """
     
-    def __init__(self, config: TrainingConfig, model: nn.Module):
+    def __init__(self, config: TrainingConfig, model: nn.Module,
+                 action_space: str = "discrete", action_dim: int = 2):
         self.config = config
         self.model = model
+        self.action_space = action_space
+        self.action_dim = action_dim
         
         # Rollout buffer
         self.buffer = RolloutBuffer(capacity=config.batch_size)
@@ -111,22 +118,27 @@ class PPOTrainer:
         env,
         observation,
         h_t,
-        m_t
-    ) -> Tuple[float, int]:
+        m_t,
+        device
+    ) -> Tuple[float, int, bool]:
         """
         Collect a rollout of experience.
         
         Args:
             env: Environment
-            observation: Current observation
+            observation: Current observation (tensor on device)
             h_t: Hidden state
             m_t: Memory read
+            device: Torch device
             
         Returns:
             total_reward: Total reward in rollout
-            rollout_length: Length of rollout
+            steps: Number of steps in this rollout
+            episode_done: Whether the episode ended
         """
         total_reward = 0.0
+        steps = 0
+        episode_done = False
         
         for _ in range(self.config.rollout_length):
             # Get action from model
@@ -137,15 +149,16 @@ class PPOTrainer:
                 policy_output = self.model.policy_head(latent)
                 value_output = self.model.critic_head(latent)
                 
-                if self.config.action_space == "discrete":
+                if self.action_space == "discrete":
                     action_probs = F.softmax(policy_output, dim=-1)
                     dist = torch.distributions.Categorical(action_probs)
                     action = dist.sample()
                     log_prob = dist.log_prob(action)
                 else:
                     # Continuous action space
-                    mean = policy_output[:, :self.config.action_dim]
-                    log_std = policy_output[:, self.config.action_dim:]
+                    mean = policy_output[:, :self.action_dim]
+                    log_std = policy_output[:, self.action_dim:]
+                    log_std = torch.clamp(log_std, -20, 2)
                     std = torch.exp(log_std)
                     dist = torch.distributions.Normal(mean, std)
                     action = dist.sample()
@@ -154,9 +167,13 @@ class PPOTrainer:
                 value = value_output.squeeze(-1)
             
             # Step environment
-            next_observation, reward, done, truncated, info = env.step(
-                action.cpu().numpy()[0]
-            )
+            action_np = action.cpu().numpy()
+            if action_np.ndim == 0:
+                action_np = action_np.item()
+            else:
+                action_np = action_np[0]
+            
+            next_observation, reward, done, truncated, info = env.step(action_np)
             done = done or truncated
             
             # Store in buffer
@@ -172,12 +189,16 @@ class PPOTrainer:
             )
             
             total_reward += reward
-            observation = torch.tensor(next_observation).unsqueeze(0).float()
+            steps += 1
+            
+            # Move next observation to device
+            observation = torch.tensor(next_observation, dtype=torch.float32, device=device).unsqueeze(0)
             
             if done:
+                episode_done = True
                 break
         
-        return total_reward, len(self.buffer)
+        return total_reward, steps, episode_done
     
     def compute_advantages(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -188,14 +209,13 @@ class PPOTrainer:
             returns: Discounted returns
         """
         rewards = self.buffer.rewards
-        values = self.buffer.values
+        values = self.buffer.values  # Now floats, not tensors
         dones = self.buffer.dones
         
         advantages = []
         returns = []
         
         # Bootstrap value
-        next_value = 0.0
         advantage = 0.0
         
         for t in reversed(range(len(rewards))):
@@ -212,11 +232,12 @@ class PPOTrainer:
             
             returns.insert(0, advantage + values[t])
         
-        advantages = torch.tensor(advantages)
-        returns = torch.tensor(returns)
+        advantages = torch.tensor(advantages, dtype=torch.float32)
+        returns = torch.tensor(returns, dtype=torch.float32)
         
         # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         return advantages, returns
     
@@ -233,6 +254,9 @@ class PPOTrainer:
         Returns:
             metrics: Training metrics
         """
+        if len(self.buffer) == 0:
+            return {"total_loss": 0.0}
+        
         # Compute advantages and returns
         advantages, returns = self.compute_advantages()
         
@@ -250,10 +274,12 @@ class PPOTrainer:
             total_value_loss = 0.0
             total_entropy = 0.0
             total_kl = 0.0
+            num_updates = 0
             
             # Mini-batch updates
-            for start in range(0, len(indices), 64):
-                end = start + 64
+            mini_batch_size = min(64, len(indices))
+            for start in range(0, len(indices), mini_batch_size):
+                end = start + mini_batch_size
                 mb_indices = indices[start:end]
                 
                 # Get mini-batch
@@ -270,13 +296,14 @@ class PPOTrainer:
                 value_output = self.model.critic_head(latent)
                 
                 # Compute new log probs
-                if self.config.action_space == "discrete":
+                if self.action_space == "discrete":
                     action_probs = F.softmax(policy_output, dim=-1)
                     dist = torch.distributions.Categorical(action_probs)
                     new_log_probs = dist.log_prob(mb_actions)
                 else:
-                    mean = policy_output[:, :self.config.action_dim]
-                    log_std = policy_output[:, self.config.action_dim:]
+                    mean = policy_output[:, :self.action_dim]
+                    log_std = policy_output[:, self.action_dim:]
+                    log_std = torch.clamp(log_std, -20, 2)
                     std = torch.exp(log_std)
                     dist = torch.distributions.Normal(mean, std)
                     new_log_probs = dist.log_prob(mb_actions).sum(dim=-1)
@@ -303,6 +330,7 @@ class PPOTrainer:
                 total_value_loss += loss_dict["value_loss"].item()
                 total_entropy += loss_dict["entropy"].item()
                 total_kl += kl.item()
+                num_updates += 1
                 
                 # Backward pass
                 optimizer.zero_grad()
@@ -318,11 +346,20 @@ class PPOTrainer:
                     break
             
             # Average metrics
-            num_updates = len(indices) // 64
-            metrics[f"epoch_{epoch}_policy_loss"] = total_policy_loss / num_updates
-            metrics[f"epoch_{epoch}_value_loss"] = total_value_loss / num_updates
-            metrics[f"epoch_{epoch}_entropy"] = total_entropy / num_updates
-            metrics[f"epoch_{epoch}_kl"] = total_kl / num_updates
+            if num_updates > 0:
+                metrics[f"epoch_{epoch}_policy_loss"] = total_policy_loss / num_updates
+                metrics[f"epoch_{epoch}_value_loss"] = total_value_loss / num_updates
+                metrics[f"epoch_{epoch}_entropy"] = total_entropy / num_updates
+                metrics[f"epoch_{epoch}_kl"] = total_kl / num_updates
+        
+        # Add aggregate metrics for easy access
+        if any("policy_loss" in k for k in metrics):
+            policy_losses = [v for k, v in metrics.items() if "policy_loss" in k]
+            metrics["policy_loss"] = sum(policy_losses) / len(policy_losses)
+        if any("value_loss" in k for k in metrics):
+            value_losses = [v for k, v in metrics.items() if "value_loss" in k]
+            metrics["value_loss"] = sum(value_losses) / len(value_losses)
+        metrics["total_loss"] = metrics.get("policy_loss", 0.0) + metrics.get("value_loss", 0.0)
         
         # Clear buffer
         self.buffer.clear()

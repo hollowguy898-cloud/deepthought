@@ -69,7 +69,10 @@ class SemanticMemory(nn.Module):
         """
         # Encode to concept
         with torch.no_grad():
-            embedding = self.concept_encoder(latent).squeeze(0)
+            embedding = self.concept_encoder(latent)
+            # Handle batch dimension - take first element
+            if embedding.dim() > 1:
+                embedding = embedding[0]
         
         # Check for similar existing concept
         similar_idx = self._find_similar(embedding)
@@ -83,10 +86,15 @@ class SemanticMemory(nn.Module):
             self.concepts[similar_idx].usage_count += 1
         else:
             # Create new concept
+            with torch.no_grad():
+                prototype = latent.detach()
+                if prototype.dim() > 1:
+                    prototype = prototype[0]
+            
             if len(self.concepts) < self.capacity:
                 concept = Concept(
                     embedding=embedding,
-                    prototype=latent.squeeze(0).detach(),
+                    prototype=prototype,
                     strength=0.5,
                     usage_count=1
                 )
@@ -99,7 +107,7 @@ class SemanticMemory(nn.Module):
                 )
                 self.concepts[weakest_idx] = Concept(
                     embedding=embedding,
-                    prototype=latent.squeeze(0).detach(),
+                    prototype=prototype,
                     strength=0.5,
                     usage_count=1
                 )
@@ -122,17 +130,23 @@ class SemanticMemory(nn.Module):
         """
         if len(self.concepts) == 0:
             device = query.device
-            return torch.zeros(1, self.latent_dim, device=device), []
+            batch_size = query.size(0)
+            return torch.zeros(batch_size, self.latent_dim, device=device), []
         
         # Encode query
         with torch.no_grad():
-            q = self.concept_encoder(query).squeeze(0)
+            q = self.concept_encoder(query)
+            # Use first element for similarity search if batched
+            if q.dim() > 1:
+                q_search = q[0]
+            else:
+                q_search = q
         
         # Compute similarities
         similarities = []
         for concept in self.concepts:
             sim = F.cosine_similarity(
-                q.unsqueeze(0),
+                q_search.unsqueeze(0),
                 concept.embedding.unsqueeze(0),
                 dim=-1
             ).item()
@@ -150,12 +164,16 @@ class SemanticMemory(nn.Module):
         # Weight by strength
         similarities_k = [similarities[i] for i in top_k_indices]
         strengths = [retrieved[i].strength for i in range(len(retrieved))]
-        weights = torch.tensor(similarities_k) * torch.tensor(strengths)
+        weights = torch.tensor(similarities_k, dtype=torch.float32) * torch.tensor(strengths, dtype=torch.float32)
         weights = F.softmax(weights, dim=0)
         
         # Aggregate prototypes
         prototypes = torch.stack([c.prototype for c in retrieved])
         semantic_read = (weights.unsqueeze(-1) * prototypes).sum(dim=0, keepdim=True)
+        
+        # Expand to match batch dimension
+        batch_size = query.size(0)
+        semantic_read = semantic_read.expand(batch_size, -1)
         
         return semantic_read, retrieved
     

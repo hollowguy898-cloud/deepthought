@@ -88,8 +88,9 @@ class MemorySystem(nn.Module):
         memory_info = {}
         
         # Read from episodic and semantic memory
-        episodic_read = torch.zeros(1, self.latent_dim, device=x_t.device)
-        semantic_read = torch.zeros(1, self.latent_dim, device=x_t.device)
+        batch_size = x_t.size(0)
+        episodic_read = torch.zeros(batch_size, self.latent_dim, device=x_t.device)
+        semantic_read = torch.zeros(batch_size, self.latent_dim, device=x_t.device)
         
         if self.episodic is not None:
             episodic_read, episodic_entries = self.episodic.read(x_t, k=5)

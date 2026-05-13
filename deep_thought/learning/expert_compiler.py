@@ -94,7 +94,7 @@ class ExpertCompiler(nn.Module):
         if parent_expert is None:
             # Create new expert with default initialization
             expert_id = 0  # Will be assigned by expert bank
-            expert = Expert(self.expert_config, expert_id)
+            expert = Expert(self.expert_config, expert_id, self.latent_dim)
         else:
             # Clone parent with noise
             expert_id = 0
@@ -123,6 +123,13 @@ class ExpertCompiler(nn.Module):
         """
         # Apply expert
         expert_output = expert(h_t)
+        
+        # Handle shape mismatch between expert output and prototype
+        if expert_output.shape != prototype.shape:
+            # Match the shapes for comparison
+            min_dim = min(expert_output.size(-1), prototype.size(-1))
+            expert_output = expert_output[..., :min_dim]
+            prototype = prototype[..., :min_dim]
         
         # Compute distance to prototype
         anchor_loss = F.mse_loss(expert_output, prototype)

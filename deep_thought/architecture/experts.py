@@ -45,14 +45,15 @@ class Expert(nn.Module):
     Uses SwiGLU activation for efficient computation.
     """
     
-    def __init__(self, config: ExpertConfig, expert_id: int):
+    def __init__(self, config: ExpertConfig, expert_id: int, latent_dim: int = 1024):
         super().__init__()
         self.config = config
         self.expert_id = expert_id
+        self.latent_dim = latent_dim
         
         # Expert network
         layers = []
-        input_dim = 1024  # Latent dimension
+        input_dim = latent_dim
         
         for i in range(config.num_layers):
             layers.append(nn.Linear(input_dim, config.hidden_dim))
@@ -73,7 +74,7 @@ class Expert(nn.Module):
         self.network = nn.Sequential(*layers)
         
         # Output projection
-        self.output = nn.Linear(config.hidden_dim, 1024)
+        self.output = nn.Linear(config.hidden_dim, latent_dim)
         
         # Stats
         self.stats = ExpertStats()
@@ -90,7 +91,7 @@ class Expert(nn.Module):
     
     def clone(self, new_id: int, noise_scale: float = 0.01) -> "Expert":
         """Clone expert with small noise for neurogenesis."""
-        new_expert = Expert(self.config, new_id)
+        new_expert = Expert(self.config, new_id, self.latent_dim)
         new_expert.load_state_dict(self.state_dict())
         
         # Add noise to weights
@@ -127,19 +128,23 @@ class ExpertBank(nn.Module):
     - Utility tracking
     - Lifecycle states (active, dormant, dead)
     - Pruning and growth
+    
+    Uses a mapping dict (expert_id -> position_in_modulelist) to maintain
+    consistent indexing even after pruning operations.
     """
     
-    def __init__(self, config: ExpertConfig, num_experts: int = 128):
+    def __init__(self, config: ExpertConfig, num_experts: int = 128, latent_dim: int = 1024):
         super().__init__()
         self.config = config
         self.num_experts = num_experts
+        self.latent_dim = latent_dim
         
-        # Create experts
-        self.experts = nn.ModuleList([
-            Expert(config, i) for i in range(num_experts)
-        ])
+        # Create experts - each expert has a unique ID that persists
+        self.experts = nn.ModuleDict({
+            str(i): Expert(config, i, latent_dim) for i in range(num_experts)
+        })
         
-        # Expert statistics
+        # Expert statistics keyed by expert ID
         self.expert_stats: Dict[int, ExpertStats] = {
             i: ExpertStats() for i in range(num_experts)
         }
@@ -153,6 +158,13 @@ class ExpertBank(nn.Module):
         
         # EMA for utility smoothing
         self.utility_ema = 0.99
+    
+    def _get_expert(self, expert_id: int) -> Optional[Expert]:
+        """Get expert by ID, returns None if not found."""
+        key = str(expert_id)
+        if key in self.experts:
+            return self.experts[key]
+        return None
     
     def forward(
         self,
@@ -177,35 +189,38 @@ class ExpertBank(nn.Module):
         compute_costs = {}
         
         # Apply each selected expert
-        for i in range(self.config.num_layers):
-            if i < selected_indices.size(-1):
-                expert_idx = selected_indices[:, i]
-                gate = gates[:, i:i+1]
-                
-                # Get unique experts in batch
-                unique_experts = expert_idx.unique()
-                
-                for exp_id in unique_experts:
-                    exp_id = exp_id.item()
-                    if exp_id >= len(self.experts):
-                        continue
-                    
-                    # Check if expert is active
-                    if self.expert_stats[exp_id].state != ExpertState.ACTIVE:
-                        continue
-                    
-                    # Mask for this expert
-                    mask = (expert_idx == exp_id).unsqueeze(-1)
-                    
-                    # Apply expert
-                    expert_output = self.experts[exp_id](h_t)
-                    delta_h = delta_h + mask * gate * expert_output
-                    
-                    # Track compute cost
-                    compute_costs[exp_id] = mask.sum().item()
-                    
-                    # Update stats
-                    self.expert_stats[exp_id].activation_count += mask.sum().item()
+        num_active = selected_indices.size(-1)  # Number of active experts per sample
+        for i in range(num_active):
+            expert_idx = selected_indices[:, i]
+            gate = gates[:, i:i+1]
+
+            # Get unique experts in batch
+            unique_experts = expert_idx.unique()
+
+            for exp_id_tensor in unique_experts:
+                exp_id = exp_id_tensor.item()
+                expert = self._get_expert(exp_id)
+                if expert is None:
+                    continue
+
+                # Check if expert is active
+                if exp_id not in self.expert_stats:
+                    continue
+                if self.expert_stats[exp_id].state != ExpertState.ACTIVE:
+                    continue
+
+                # Mask for this expert
+                mask = (expert_idx == exp_id).unsqueeze(-1)
+
+                # Apply expert
+                expert_output = expert(h_t)
+                delta_h = delta_h + mask * gate * expert_output
+
+                # Track compute cost
+                compute_costs[exp_id] = mask.sum().item()
+
+                # Update stats
+                self.expert_stats[exp_id].activation_count += mask.sum().item()
         
         return delta_h, compute_costs
     
@@ -281,12 +296,11 @@ class ExpertBank(nn.Module):
             if stats.state == ExpertState.DEAD
         ]
         
-        # Remove from module list
-        active_experts = [
-            exp for i, exp in enumerate(self.experts)
-            if self.expert_stats[i].state != ExpertState.DEAD
-        ]
-        self.experts = nn.ModuleList(active_experts)
+        # Remove from module dict
+        for exp_id in dead_ids:
+            key = str(exp_id)
+            if key in self.experts:
+                del self.experts[key]
         
         # Update stats
         for exp_id in dead_ids:
@@ -316,10 +330,20 @@ class ExpertBank(nn.Module):
                 key=lambda x: x[1].utility_score
             )[0]
         
+        # Generate new unique ID
+        if self.expert_stats:
+            new_id = max(self.expert_stats.keys()) + 1
+        else:
+            new_id = 0
+        
         # Clone parent
-        new_id = len(self.experts)
-        new_expert = self.experts[parent_id].clone(new_id, noise_scale)
-        self.experts.append(new_expert)
+        parent_expert = self._get_expert(parent_id)
+        if parent_expert is not None:
+            new_expert = parent_expert.clone(new_id, noise_scale)
+        else:
+            new_expert = Expert(self.config, new_id, self.latent_dim)
+        
+        self.experts[str(new_id)] = new_expert
         self.expert_stats[new_id] = ExpertStats(state=ExpertState.ACTIVE)
         
         return new_id
@@ -377,13 +401,19 @@ class ExpertBank(nn.Module):
         if expert_id1 not in self.expert_stats or expert_id2 not in self.expert_stats:
             return
         
+        expert1 = self._get_expert(expert_id1)
+        expert2 = self._get_expert(expert_id2)
+        if expert1 is None or expert2 is None:
+            return
+        
         # Average weights
         with torch.no_grad():
-            for p1, p2 in zip(
-                self.experts[expert_id1].parameters(),
-                self.experts[expert_id2].parameters()
-            ):
+            for p1, p2 in zip(expert1.parameters(), expert2.parameters()):
                 p1.data = (p1.data + p2.data) / 2
         
         # Mark second as dead
         self.expert_stats[expert_id2].state = ExpertState.DEAD
+    
+    def __len__(self):
+        """Return number of experts."""
+        return len(self.experts)

@@ -72,12 +72,9 @@ class WorldModel(nn.Module):
                 nn.Linear(config.hidden_dim // 2, 1),
             )
         
-        # Observation decoder (for reconstruction loss)
-        self.observation_decoder = nn.Sequential(
-            nn.Linear(config.latent_dim, config.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(config.hidden_dim, config.observation_dim),
-        )
+        # Observation decoder (for reconstruction loss) - initialized lazily
+        self.observation_decoder = None
+        self._obs_dim = None
     
     def forward(
         self,
@@ -117,7 +114,22 @@ class WorldModel(nn.Module):
     
     def decode_observation(self, z: torch.Tensor) -> torch.Tensor:
         """Decode latent to observation space."""
+        if self.observation_decoder is None:
+            # Cannot decode without observation_dim
+            return z
         return self.observation_decoder(z)
+
+    def set_observation_dim(self, obs_dim: int):
+        """Set observation dimension and initialize decoder."""
+        if self._obs_dim == obs_dim and self.observation_decoder is not None:
+            return
+        self._obs_dim = obs_dim
+        device = next(self.parameters()).device
+        self.observation_decoder = nn.Sequential(
+            nn.Linear(self.latent_dim, self.config.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.config.hidden_dim, obs_dim),
+        ).to(device)
     
     def imagine_rollout(
         self,

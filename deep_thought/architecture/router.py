@@ -22,7 +22,7 @@ class NoisyTopKRouter(nn.Module):
     and prevent routing collapse.
     """
     
-    def __init__(self, config: RouterConfig):
+    def __init__(self, config: RouterConfig, latent_dim: Optional[int] = None):
         super().__init__()
         self.config = config
         self.num_experts = config.num_experts
@@ -30,16 +30,34 @@ class NoisyTopKRouter(nn.Module):
         self.hidden_dim = config.hidden_dim
         self.noise_epsilon = config.noise_epsilon
         
-        # Router network
-        self.router = nn.Sequential(
-            nn.Linear(3072, config.hidden_dim),  # h_t, x_t, m_t concatenated
-            nn.SiLU(),
-            nn.Linear(config.hidden_dim, config.num_experts),
-        )
+        # Router network - input is concatenated h_t, x_t, m_t (each latent_dim)
+        self._latent_dim = latent_dim
+        if latent_dim is not None:
+            self.router = nn.Sequential(
+                nn.Linear(latent_dim * 3, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, self.num_experts),
+            )
+        else:
+            # Will be initialized lazily
+            self.router = None
         
         # Load balancing loss tracking
-        self.register_buffer("expert_usage", torch.zeros(config.num_experts))
+        self.register_buffer("expert_usage", torch.zeros(self.num_experts))
         self.usage_ema = 0.99
+    
+    def _ensure_router(self, h_t: torch.Tensor):
+        """Lazily initialize router if needed."""
+        if self.router is None:
+            latent_dim = h_t.size(-1)
+            self._latent_dim = latent_dim
+            self.router = nn.Sequential(
+                nn.Linear(latent_dim * 3, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, self.num_experts),
+            )
+            # Move to same device as input
+            self.router = self.router.to(h_t.device)
     
     def forward(
         self,
@@ -64,7 +82,10 @@ class NoisyTopKRouter(nn.Module):
         """
         # Concatenate inputs
         combined = torch.cat([h_t, x_t, m_t], dim=-1)
-        
+
+        # Ensure router is initialized
+        self._ensure_router(h_t)
+
         # Compute router logits
         logits = self.router(combined)
         
@@ -84,7 +105,7 @@ class NoisyTopKRouter(nn.Module):
         )
         
         # Normalize gates
-        gates = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        gates = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-8)
         
         # Update expert usage statistics
         if training:
@@ -147,23 +168,41 @@ class AdaptiveRouter(nn.Module):
     - Meta-router controller
     """
     
-    def __init__(self, config: RouterConfig, context_dim: int = 256):
+    def __init__(self, config: RouterConfig, context_dim: int = 256, latent_dim: Optional[int] = None):
         super().__init__()
         self.config = config
         self.context_dim = context_dim
         
         # Base router
-        self.base_router = NoisyTopKRouter(config)
+        self.base_router = NoisyTopKRouter(config, latent_dim=latent_dim)
         
-        # Adaptation controller
-        self.adapter = nn.Sequential(
-            nn.Linear(context_dim + 1, config.hidden_dim),  # +1 for error
-            nn.SiLU(),
-            nn.Linear(config.hidden_dim, config.num_experts),
-        )
+        # Context encoder - will be lazily initialized if latent_dim not known
+        self._latent_dim = latent_dim
+        if latent_dim is not None:
+            self.context_encoder = nn.Linear(latent_dim * 3, self.context_dim)
+        else:
+            self.context_encoder = None
         
-        # Context encoder
-        self.context_encoder = nn.Linear(3072, context_dim)
+        # Adapter - will be lazily initialized
+        self.adapter = None
+        self._adapter_input_dim = None
+    
+    def _ensure_modules(self, h_t: torch.Tensor, x_t: torch.Tensor, m_t: torch.Tensor):
+        """Lazily initialize context encoder and adapter."""
+        combined = torch.cat([h_t, x_t, m_t], dim=-1)
+        
+        if self.context_encoder is None:
+            input_dim = combined.size(-1)
+            self.context_encoder = nn.Linear(input_dim, self.context_dim).to(combined.device)
+        
+        if self.adapter is None:
+            # adapter_input = context + prediction_error (1 dim)
+            self._adapter_input_dim = self.context_dim + 1
+            self.adapter = nn.Sequential(
+                nn.Linear(self._adapter_input_dim, self.config.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.config.hidden_dim, self.config.num_experts),
+            ).to(combined.device)
     
     def forward(
         self,
@@ -195,6 +234,9 @@ class AdaptiveRouter(nn.Module):
             h_t, x_t, m_t, training
         )
         
+        # Ensure adapter modules are initialized
+        self._ensure_modules(h_t, x_t, m_t)
+        
         # Encode context if not provided
         if context is None:
             combined = torch.cat([h_t, x_t, m_t], dim=-1)
@@ -203,11 +245,23 @@ class AdaptiveRouter(nn.Module):
         # Adaptation based on context and error
         if prediction_error is not None:
             # Normalize error
-            error_norm = (prediction_error - prediction_error.mean()) / \
-                        (prediction_error.std() + 1e-8)
-            adapter_input = torch.cat([context, error_norm.unsqueeze(-1)], dim=-1)
+            if prediction_error.dim() == 0:
+                # Scalar tensor
+                error_norm = prediction_error.unsqueeze(0).unsqueeze(0)
+                if error_norm.size(0) != context.size(0):
+                    error_norm = error_norm.expand(context.size(0), 1)
+            else:
+                error_norm = (prediction_error - prediction_error.mean()) / \
+                            (prediction_error.std() + 1e-8)
+                if error_norm.dim() == 1:
+                    error_norm = error_norm.unsqueeze(-1)
+                elif error_norm.dim() == 0:
+                    error_norm = error_norm.unsqueeze(0).unsqueeze(0)
+                    error_norm = error_norm.expand(context.size(0), 1)
+            adapter_input = torch.cat([context, error_norm], dim=-1)
         else:
-            adapter_input = context
+            # Use zeros for prediction_error placeholder
+            adapter_input = torch.cat([context, torch.zeros(context.size(0), 1, device=context.device)], dim=-1)
         
         adaptation = self.adapter(adapter_input)
         
@@ -223,7 +277,7 @@ class AdaptiveRouter(nn.Module):
         )
         
         # Normalize gates
-        gates = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        gates = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-8)
         
         # Update info
         info = base_info
@@ -241,15 +295,16 @@ class SparseRouter(nn.Module):
     context and error signals.
     """
     
-    def __init__(self, config: RouterConfig, use_adaptive: bool = True):
+    def __init__(self, config: RouterConfig, use_adaptive: bool = True, 
+                 latent_dim: Optional[int] = None, context_dim: int = 256):
         super().__init__()
         self.config = config
         self.use_adaptive = use_adaptive
         
         if use_adaptive:
-            self.router = AdaptiveRouter(config)
+            self.router = AdaptiveRouter(config, context_dim=context_dim, latent_dim=latent_dim)
         else:
-            self.router = NoisyTopKRouter(config)
+            self.router = NoisyTopKRouter(config, latent_dim=latent_dim)
     
     def forward(
         self,
@@ -271,18 +326,29 @@ class SparseRouter(nn.Module):
     def compute_losses(self, info: dict) -> dict:
         """Compute routing losses."""
         losses = {}
-        
+
         # Load balance loss
-        losses["load_balance"] = self.router.base_router.load_balance_loss()
-        
+        if self.use_adaptive:
+            losses["load_balance"] = self.router.base_router.load_balance_loss()
+        else:
+            losses["load_balance"] = self.router.load_balance_loss()
+
         # Entropy loss
         if "entropy" in info:
-            losses["entropy"] = self.router.base_router.entropy_loss(
-                info["entropy"]
-            )
-        
+            if self.use_adaptive:
+                losses["entropy"] = self.router.base_router.entropy_loss(
+                    info["entropy"]
+                )
+            else:
+                losses["entropy"] = self.router.entropy_loss(
+                    info["entropy"]
+                )
+
         return losses
     
     def get_expert_usage(self) -> torch.Tensor:
         """Get current expert usage statistics."""
-        return self.router.base_router.expert_usage.clone()
+        if self.use_adaptive:
+            return self.router.base_router.expert_usage.clone()
+        else:
+            return self.router.expert_usage.clone()

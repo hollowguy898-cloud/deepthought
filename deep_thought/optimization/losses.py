@@ -40,11 +40,23 @@ def compute_ppo_loss(
     surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
     policy_loss = -torch.min(surr1, surr2).mean()
     
-    # Value loss
+    # Value loss - ensure same shape
+    if values.dim() != returns.dim():
+        if values.dim() > returns.dim():
+            values = values.squeeze(-1)
+        else:
+            returns = returns.unsqueeze(-1)
     value_loss = F.mse_loss(values, returns)
     
-    # Entropy bonus
-    entropy = -(log_probs * torch.exp(log_probs)).sum(dim=-1).mean()
+    # Entropy bonus - use proper entropy computation
+    # For discrete: entropy = -sum(p * log(p))
+    # For continuous with log_probs: use -log_probs as proxy
+    # Clamp log_probs for numerical stability
+    clamped_log_probs = torch.clamp(log_probs, min=-20, max=20)
+    probs = torch.exp(clamped_log_probs)
+    entropy = -(probs * clamped_log_probs).sum(dim=-1).mean()
+    # Clamp entropy to prevent extreme values
+    entropy = torch.clamp(entropy, min=-10, max=10)
     entropy_loss = -entropy_coef * entropy
     
     # Total loss
@@ -137,20 +149,20 @@ def compute_compute_penalty(
         coef: Penalty coefficient
         
     Returns:
-        compute_loss: Compute penalty loss
+        compute_loss: Compute penalty loss (tensor)
     """
-    total_cost = 0.0
+    total_cost = torch.tensor(0.0, device=gates.device)
     
     for i in range(selected_indices.size(-1)):
         expert_idx = selected_indices[:, i]
         gate = gates[:, i]
         
         for exp_id in expert_idx.unique():
-            exp_id = exp_id.item()
-            if exp_id in expert_costs:
-                cost = expert_costs[exp_id]
+            exp_id_val = exp_id.item()
+            if exp_id_val in expert_costs:
+                cost = expert_costs[exp_id_val]
                 mask = (expert_idx == exp_id).float()
-                total_cost += (gate * mask * cost).sum()
+                total_cost = total_cost + (gate * mask * cost).sum()
     
     compute_loss = coef * total_cost / gates.size(0)
     

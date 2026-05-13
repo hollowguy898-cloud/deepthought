@@ -46,27 +46,22 @@ class TemporalPlanningLayer(nn.Module):
     - Counterfactual simulation
     """
     
-    def __init__(self, config: PlanningConfig, num_experts: int = 128):
+    def __init__(self, config: PlanningConfig, num_experts: int = 128, 
+                 latent_dim: Optional[int] = None, action_dim: Optional[int] = None):
         super().__init__()
         self.config = config
         self.num_experts = num_experts
+        self._latent_dim = latent_dim
         
-        # Planning network
-        self.planner = nn.Sequential(
-            nn.Linear(3072, 1024),  # h_t, x_t, m_t
-            nn.ReLU(),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Linear(512, config.planning_horizon * num_experts),
-        )
-        
-        # Execution controller
-        self.controller = nn.GUCell(
-            input_size=3072 + num_experts,  # state + action
-            hidden_size=512
-        )
-        
-        # Goal compression network
+        # Planning network - will be lazily initialized if latent_dim not provided
+        if latent_dim is not None:
+            self._init_networks(latent_dim, action_dim)
+        else:
+            self.planner = None
+            self.controller = None
+            self._networks_initialized = False
+
+        # Goal compression network - fixed size
         self.goal_compressor = nn.Sequential(
             nn.Linear(1024, 512),
             nn.ReLU(),
@@ -80,6 +75,42 @@ class TemporalPlanningLayer(nn.Module):
         self.current_plan: Optional[Plan] = None
         self.plan_step = 0
         self.controller_state = None
+        
+        self._action_dim = action_dim
+    
+    def _init_networks(self, latent_dim: int, action_dim: Optional[int] = None):
+        """Initialize planner and controller networks."""
+        self._latent_dim = latent_dim
+        input_dim = latent_dim * 3  # h_t, x_t, m_t
+        
+        self.planner = nn.Sequential(
+            nn.Linear(input_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, self.config.planning_horizon * self.num_experts),
+        )
+
+        # Controller uses h_t, x_t, m_t concatenated (same as planner input)
+        controller_input_dim = input_dim
+        self.controller = nn.GRUCell(
+            input_size=controller_input_dim,
+            hidden_size=512
+        )
+        
+        self._networks_initialized = True
+    
+    def _ensure_initialized(self, h_t: torch.Tensor):
+        """Lazily initialize planner and controller once latent dim is known."""
+        if self._networks_initialized:
+            return
+        latent_dim = h_t.size(-1)
+        self._init_networks(latent_dim, self._action_dim)
+        
+        # Move to same device
+        device = h_t.device
+        self.planner = self.planner.to(device)
+        self.controller = self.controller.to(device)
     
     def construct_timeline(
         self,
@@ -95,17 +126,17 @@ class TemporalPlanningLayer(nn.Module):
             h_t: Hidden state
             x_t: Encoded observation
             m_t: Memory read
-            context: Context embedding
+            context: Context embedding (ignored - planner uses fixed input dim)
             
         Returns:
             timeline: Compressed future trajectory
         """
-        # Concatenate inputs
+        # Initialize planner and controller if needed
+        self._ensure_initialized(h_t)
+
+        # Concatenate inputs (context is intentionally not included to keep
+        # input dimensions consistent with the planner network)
         combined = torch.cat([h_t, x_t, m_t], dim=-1)
-        
-        # Add context if available
-        if context is not None:
-            combined = torch.cat([combined, context], dim=-1)
         
         # Plan timeline
         timeline = self.planner(combined)
@@ -134,12 +165,15 @@ class TemporalPlanningLayer(nn.Module):
         horizon = timeline.size(1)
         schedules = []
         
+        # Clamp k to actual number of experts available
+        actual_k = min(k, timeline.size(-1))
+        
         for t in range(horizon):
             # Get top-k experts for this timestep
             step_logits = timeline[:, t, :]
-            top_k_vals, top_k_idx = torch.topk(step_logits, k, dim=-1)
+            top_k_vals, top_k_idx = torch.topk(step_logits, actual_k, dim=-1)
             
-            for i in range(k):
+            for i in range(actual_k):
                 expert_id = top_k_idx[0, i].item()
                 priority = top_k_vals[0, i].item()
                 
@@ -171,16 +205,19 @@ class TemporalPlanningLayer(nn.Module):
         """
         horizon = timeline.size(1)
         
+        # Clamp k to actual number of experts available
+        actual_k = min(k, timeline.size(-1))
+        
         # Get top-k per timestep
         gates = []
         indices = []
         
         for t in range(horizon):
             step_logits = timeline[:, t, :]
-            top_k_vals, top_k_idx = torch.topk(step_logits, k, dim=-1)
+            top_k_vals, top_k_idx = torch.topk(step_logits, actual_k, dim=-1)
             
             # Normalize gates
-            normalized_gates = top_k_vals / top_k_vals.sum(dim=-1, keepdim=True)
+            normalized_gates = top_k_vals / (top_k_vals.sum(dim=-1, keepdim=True) + 1e-8)
             
             gates.append(normalized_gates)
             indices.append(top_k_idx)
@@ -195,7 +232,7 @@ class TemporalPlanningLayer(nn.Module):
         h_t: torch.Tensor,
         x_t: torch.Tensor,
         m_t: torch.Tensor,
-        action: torch.Tensor
+        action: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Update execution controller state.
@@ -204,13 +241,16 @@ class TemporalPlanningLayer(nn.Module):
             h_t: Hidden state
             x_t: Encoded observation
             m_t: Memory read
-            action: Action taken
+            action: Action taken (unused - controller uses same input as planner)
             
         Returns:
             controller_state: Updated controller state
         """
-        # Concatenate inputs
-        combined = torch.cat([h_t, x_t, m_t, action], dim=-1)
+        # Ensure controller is initialized
+        self._ensure_initialized(h_t)
+
+        # Concatenate inputs (same as planner input)
+        combined = torch.cat([h_t, x_t, m_t], dim=-1)
         
         # Update controller
         if self.controller_state is None:
@@ -299,13 +339,14 @@ class TemporalPlanningLayer(nn.Module):
             goal: Compressed goal vector
         """
         # Pad or truncate to horizon
-        if rewards.size(0) < horizon:
-            padded = F.pad(rewards, (0, horizon - rewards.size(0)))
+        if rewards.numel() < horizon:
+            padded = F.pad(rewards.view(-1), (0, horizon - rewards.numel()))
         else:
-            padded = rewards[:horizon]
+            padded = rewards.view(-1)[:horizon]
         
-        # Compress
-        goal = self.goal_compressor(padded.unsqueeze(0))
+        # Compress - pad to 1024 for goal_compressor input
+        padded_1024 = F.pad(padded, (0, 1024 - padded.numel()))
+        goal = self.goal_compressor(padded_1024.unsqueeze(0))
         
         return goal
     
@@ -381,7 +422,7 @@ class TemporalPlanningLayer(nn.Module):
         self.plan_step += 1
         
         # Check if plan is complete
-        if self.current_plan is not None:
+        if self.current_plan is not None and self.current_plan.schedules:
             max_step = max(s.start_step + s.duration for s in self.current_plan.schedules)
             if self.plan_step >= max_step:
                 self.current_plan = None

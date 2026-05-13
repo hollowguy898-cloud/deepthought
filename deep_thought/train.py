@@ -7,6 +7,8 @@ import torch.optim as optim
 import gymnasium as gym
 from tqdm import tqdm
 import os
+from typing import Optional
+import numpy as np
 
 from deep_thought.agent import DeepThoughtAgent
 from deep_thought.config import DeepThoughtConfig
@@ -15,6 +17,46 @@ from deep_thought.optimization.schedulers import CosineAnnealingWarmupScheduler
 from deep_thought.utils.logger import setup_logger
 from deep_thought.utils.metrics import MetricsTracker
 from deep_thought.utils.checkpoint import save_checkpoint, load_checkpoint
+
+
+def _get_env_info(env_id: str):
+    """Get observation dim, action dim, and action space type from env."""
+    env = gym.make(env_id)
+    
+    # Observation space
+    if isinstance(env.observation_space, gym.spaces.Box):
+        if len(env.observation_space.shape) == 1:
+            observation_dim = env.observation_space.shape[0]
+        else:
+            # Image observation - flatten
+            observation_dim = int(np.prod(env.observation_space.shape))
+    elif isinstance(env.observation_space, gym.spaces.Dict):
+        # Take first key
+        first_key = list(env.observation_space.spaces.keys())[0]
+        observation_dim = int(np.prod(env.observation_space[first_key].shape))
+    else:
+        observation_dim = 1
+    
+    # Action space
+    if isinstance(env.action_space, gym.spaces.Discrete):
+        action_dim = env.action_space.n
+        num_actions = action_dim
+        action_space_type = "discrete"
+    elif isinstance(env.action_space, gym.spaces.Box):
+        action_dim = env.action_space.shape[0]
+        num_actions = action_dim * 2  # mean + log_std for continuous
+        action_space_type = "continuous"
+    elif isinstance(env.action_space, gym.spaces.MultiDiscrete):
+        action_dim = env.action_space.nvec.sum()
+        num_actions = action_dim
+        action_space_type = "discrete"
+    else:
+        action_dim = env.action_space.n
+        num_actions = action_dim
+        action_space_type = "discrete"
+    
+    env.close()
+    return observation_dim, action_dim, num_actions, action_space_type
 
 
 def train(
@@ -39,19 +81,23 @@ def train(
     logger.info(f"Training on device: {device}")
     logger.info(f"Environment: {env_id}")
     
-    # Create environment
+    # Create environment to get info
     env = gym.make(env_id)
-    observation_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
+    observation_dim, action_dim, num_actions, action_space_type = _get_env_info(env_id)
+    
+    logger.info(f"Observation dim: {observation_dim}, Action dim: {action_dim}, "
+                f"Action space: {action_space_type}")
     
     # Update config
     config.observation_dim = observation_dim
     config.action_dim = action_dim
-    config.num_actions = action_dim
-    config.action_space = "discrete"
+    config.num_actions = num_actions
+    config.action_space = action_space_type
     
     # Create agent
     agent = DeepThoughtAgent(config).to(device)
+    
+    logger.info(f"Agent created with {sum(p.numel() for p in agent.parameters())} parameters")
     
     # Create optimizer
     optimizer = optim.Adam(
@@ -67,7 +113,11 @@ def train(
     )
     
     # Create PPO trainer
-    ppo_trainer = PPOTrainer(config.training, agent)
+    ppo_trainer = PPOTrainer(
+        config.training, agent,
+        action_space=config.action_space,
+        action_dim=config.action_dim
+    )
     
     # Create metrics tracker
     metrics_tracker = MetricsTracker()
@@ -76,14 +126,14 @@ def train(
     start_step = 0
     if resume_from is not None and os.path.exists(resume_from):
         logger.info(f"Resuming from {resume_from}")
-        checkpoint = load_checkpoint(resume_from, agent, optimizer, device)
+        checkpoint = load_checkpoint(resume_from, agent, optimizer, str(device))
         start_step = checkpoint["step"]
     
     # Training loop
     logger.info("Starting training...")
     
     observation, _ = env.reset()
-    observation = torch.tensor(observation).unsqueeze(0).float().to(device)
+    observation = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
     agent.reset(1)
     
     episode_reward = 0.0
@@ -91,8 +141,8 @@ def train(
     
     for step in tqdm(range(start_step, total_steps), desc="Training"):
         # Collect rollout
-        rollout_reward, rollout_length = ppo_trainer.collect_rollout(
-            env, observation, agent.h_t, agent.m_t
+        rollout_reward, rollout_length, episode_done = ppo_trainer.collect_rollout(
+            env, observation, agent.h_t, agent.m_t, device
         )
         
         episode_reward += rollout_reward
@@ -103,13 +153,13 @@ def train(
         scheduler.step()
         
         # Update agent systems
-        if step % config.training.prune_interval == 0:
+        if step % config.training.prune_interval == 0 and step > 0:
             agent.prune_experts()
         
-        if step % config.training.growth_interval == 0:
+        if step % config.training.growth_interval == 0 and step > 0:
             agent.grow_experts()
         
-        if step % 10000 == 0:
+        if step % 10000 == 0 and step > 0:
             agent.consolidate_memory()
             agent.validate_features()
         
@@ -119,24 +169,25 @@ def train(
         # Track metrics
         metrics_tracker.update(metrics)
         
-        # Reset if episode done
-        done = rollout_length < config.training.rollout_length
-        if done:
+        # Handle episode reset
+        if episode_done:
             metrics_tracker.add_episode(episode_reward, episode_length)
             episode_reward = 0.0
             episode_length = 0
             observation, _ = env.reset()
-            observation = torch.tensor(observation).unsqueeze(0).float().to(device)
+            observation = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
             agent.reset(1)
         else:
-            # Get last observation from buffer
+            # Get last observation from buffer - already on device from collect_rollout
             if len(ppo_trainer.buffer) > 0:
-                observation = ppo_trainer.buffer.observations[-1].to(device)
+                last_obs = ppo_trainer.buffer.observations[-1]
+                observation = last_obs.detach()
         
         # Logging
         if step % config.log_interval == 0:
             episode_stats = metrics_tracker.get_episode_stats()
             agent_stats = agent.get_stats()
+            total_loss = metrics_tracker.get_metric("total_loss")
             
             logger.info(
                 f"Step {step} | "
@@ -144,12 +195,17 @@ def train(
                 f"Length: {episode_stats['mean_length']:.1f} | "
                 f"Experts: {agent_stats['num_experts']} | "
                 f"Active: {agent_stats['active_experts']} | "
-                f"Loss: {metrics_tracker.get_metric('total_loss'):.4f}"
+                f"Loss: {total_loss:.4f}" if total_loss is not None else
+                f"Step {step} | "
+                f"Reward: {episode_stats['mean_reward']:.2f} | "
+                f"Length: {episode_stats['mean_length']:.1f} | "
+                f"Experts: {agent_stats['num_experts']} | "
+                f"Active: {agent_stats['active_experts']}"
             )
         
         # Evaluation
         if step % config.eval_interval == 0 and step > 0:
-            eval_reward = evaluate(agent, env, device, num_episodes=10)
+            eval_reward = evaluate(agent, env_id, device, num_episodes=10)
             logger.info(f"Evaluation reward: {eval_reward:.2f}")
         
         # Checkpoint
@@ -170,6 +226,7 @@ def train(
     logger.info("Training complete!")
     
     # Final save
+    os.makedirs(config.log_dir, exist_ok=True)
     final_path = os.path.join(config.log_dir, "final_checkpoint.pt")
     save_checkpoint(
         agent,
@@ -182,7 +239,7 @@ def train(
 
 def evaluate(
     agent: DeepThoughtAgent,
-    env: gym.Env,
+    env_id: str,
     device: torch.device,
     num_episodes: int = 10
 ) -> float:
@@ -191,7 +248,7 @@ def evaluate(
     
     Args:
         agent: Agent to evaluate
-        env: Environment
+        env_id: Environment ID (create fresh env to avoid state issues)
         device: Device
         num_episodes: Number of episodes
         
@@ -200,11 +257,12 @@ def evaluate(
     """
     agent.eval()
     
+    env = gym.make(env_id)
     total_rewards = []
     
     for _ in range(num_episodes):
         observation, _ = env.reset()
-        observation = torch.tensor(observation).unsqueeze(0).float().to(device)
+        observation = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
         agent.reset(1)
         
         episode_reward = 0.0
@@ -214,16 +272,21 @@ def evaluate(
             with torch.no_grad():
                 action, _, _ = agent.act(observation, deterministic=True)
             
-            observation, reward, done, truncated, _ = env.step(
-                action.cpu().numpy()[0]
-            )
+            action_np = action.cpu().numpy()
+            if action_np.ndim == 0:
+                action_np = action_np.item()
+            else:
+                action_np = action_np[0]
+            
+            observation, reward, done, truncated, _ = env.step(action_np)
             done = done or truncated
-            observation = torch.tensor(observation).unsqueeze(0).float().to(device)
+            observation = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
             
             episode_reward += reward
         
         total_rewards.append(episode_reward)
     
+    env.close()
     agent.train()
     
     return sum(total_rewards) / len(total_rewards)
