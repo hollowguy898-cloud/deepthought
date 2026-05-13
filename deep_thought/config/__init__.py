@@ -147,6 +147,202 @@ class SRPConfig:
 
 
 @dataclass
+class CuriosityConfig:
+    """Curiosity and intrinsic motivation configuration."""
+    use_curiosity: bool = True
+    prediction_error_coef: float = 0.1
+    novelty_coef: float = 0.05
+    uncertainty_coef: float = 0.05
+    info_gain_coef: float = 0.02
+    curiosity_decay: float = 0.999
+    visit_count_hash_size: int = 10000
+    min_curiosity: float = 0.001
+    max_intrinsic_reward: float = 1.0
+    state_embedding_dim: int = 64
+
+
+@dataclass
+class SubgoalConfig:
+    """Self-generated subgoal system configuration."""
+    use_subgoals: bool = True
+    goal_embedding_dim: int = 256
+    max_active_subgoals: int = 5
+    subgoal_proposal_interval: int = 50
+    completion_threshold: float = 0.8
+    decomposition_depth: int = 3
+    subgoal_reward_coef: float = 0.1
+    subgoal_types: list = field(default_factory=lambda: ["explore", "secure", "conserve", "reduce_uncertainty", "probe"])
+
+
+@dataclass
+class OpponentModelingConfig:
+    """Opponent and social modeling configuration.
+
+    Controls the opponent modeling system that tracks opponent tendencies,
+    deception patterns, risk preferences, and habitual movement patterns.
+
+    Attributes:
+        use_opponent_modeling: Whether to enable opponent modeling.
+            If False, the system returns zero opponent contexts.
+        opponent_latent_dim: Dimensionality of the opponent latent space
+            produced by the OpponentEncoder.
+        tendency_dim: Dimensionality of the tendency embedding produced
+            by the TendencyTracker.
+        max_opponents: Maximum number of opponents that can be tracked
+            simultaneously.
+        strategy_horizon: Number of future steps the StrategyPredictor
+            auto-regressively rolls out.
+        deception_threshold: Threshold above which an opponent is
+            considered deceptive by the DeceptionDetector.
+        risk_estimation_ema: Exponential moving average decay for the
+            RiskProfileEstimator.  Higher values make risk estimates
+            more stable; lower values make them more reactive.
+        tendency_update_rate: EMA update rate for the tendency vectors.
+            Controls how quickly the stored tendency adapts to new
+            observations.
+        num_tendency_types: Number of discrete tendency categories
+            (e.g., aggressive, defensive, deceptive, exploratory,
+            conservative, chaotic, cooperative, opportunistic).
+    """
+    use_opponent_modeling: bool = True
+    opponent_latent_dim: int = 256
+    tendency_dim: int = 64
+    max_opponents: int = 8
+    strategy_horizon: int = 10
+    deception_threshold: float = 0.5
+    risk_estimation_ema: float = 0.95
+    tendency_update_rate: float = 0.01
+    num_tendency_types: int = 8  # aggressive, defensive, deceptive, etc.
+
+
+@dataclass
+class HierarchicalConfig:
+    """Hierarchical expert society configuration."""
+    use_hierarchy: bool = True
+    num_tiers: int = 4
+    reflex_experts: int = 32
+    tactical_experts: int = 16
+    strategic_experts: int = 8
+    meta_experts: int = 4
+    reflex_hidden_dim: int = 256
+    tactical_hidden_dim: int = 512
+    strategic_hidden_dim: int = 512
+    meta_hidden_dim: int = 256
+    compute_budget_total: float = 1.0
+    budget_allocation_lr: float = 0.01
+
+
+@dataclass
+class ComputeEconomyConfig:
+    """Dynamic compute economy configuration.
+
+    Controls the competitive market where experts bid for compute
+    resources.  The market allocates compute to experts that can
+    make the best use of it, while enforcing a global energy budget
+    that prevents runaway computation.
+
+    Attributes:
+        use_compute_market: Whether to enable the compute market.
+            If False, compute is allocated equally across experts.
+        total_energy_budget: Maximum compute energy capacity.  The
+            total compute spent by all experts in a single step
+            cannot exceed this value.
+        energy_recharge_rate: How much energy is restored per step.
+            A rate of 1.0 means the budget fully recharges each step;
+            lower rates enforce stronger compute conservation.
+        min_bid_price: Floor price for compute bids.  Ensures every
+            bid has a non-trivial cost, preventing zero-cost compute
+            grabs.
+        auction_type: Auction mechanism to use.  ``"sealed_bid"``
+            is a first-price auction; ``"vickrey"`` is a second-price
+            auction that encourages truthful bidding.
+        credit_ema: Exponential moving average decay for expert
+            credit updates.  A value close to 1.0 makes credit
+            change slowly (stable); closer to 0.0 makes it reactive.
+        bidding_hidden_dim: Width of the hidden layer in each
+            expert's bidding MLP.
+        market_temperature: Softmax temperature for the differentiable
+            soft auction.  Higher temperatures produce more uniform
+            allocations; lower temperatures concentrate compute on
+            the highest-priority experts.
+    """
+    use_compute_market: bool = True
+    total_energy_budget: float = 100.0
+    energy_recharge_rate: float = 1.0
+    min_bid_price: float = 0.01
+    auction_type: str = "sealed_bid"  # sealed_bid, vickrey
+    credit_ema: float = 0.99
+    bidding_hidden_dim: int = 128
+    market_temperature: float = 1.0
+
+
+@dataclass
+class AttentionMapsConfig:
+    """Attention-Based Probability Maps configuration.
+
+    Controls the attention-driven probability map system that dynamically
+    allocates compute based on confidence, uncertainty, and temporal
+    evolution signals.
+
+    Attributes:
+        use_attention_maps: Whether to enable attention probability maps.
+            If False, the latent representation is passed through without
+            attention weighting.
+        num_heads: Number of attention heads for multi-head content
+            attention.  Must evenly divide *latent_dim*.
+        confidence_decay: Exponential moving average decay for the
+            confidence tracker.  Values closer to 1.0 make confidence
+            estimates more stable; closer to 0.0 makes them reactive.
+        uncertainty_threshold: Threshold above which a region is
+            classified as high-uncertainty and given additional compute.
+        evolution_hidden_dim: Hidden size of the GRU cell in the
+            temporal evolution module.
+        min_attention: Floor value for attention weights.  Prevents
+            any dimension from receiving exactly zero compute.
+    """
+    use_attention_maps: bool = True
+    num_heads: int = 8
+    confidence_decay: float = 0.99
+    uncertainty_threshold: float = 0.5
+    evolution_hidden_dim: int = 256
+    min_attention: float = 0.01
+
+
+@dataclass
+class MetaLearningRulesConfig:
+    """Meta-Learning of Learning Rules configuration.
+
+    Controls the learned optimiser that replaces hand-designed learning-rate
+    schedules with an LSTM-based network that produces per-parameter-group
+    hyperparameters (lr, momentum, weight_decay).
+
+    Attributes:
+        use_meta_optimizer: Whether to enable the meta-optimiser.  If False,
+            a standard optimiser (e.g. Adam) should be used instead.
+        hidden_dim: Hidden size of the LSTM in the UpdateRuleNetwork.
+        num_lstm_layers: Number of stacked LSTM layers.
+        max_learning_rate: Upper bound on the learning rate output.
+        min_learning_rate: Lower bound on the learning rate output.
+        max_weight_decay: Upper bound on the weight-decay output.
+        meta_lr: Learning rate for the meta-optimiser itself (Adam over the
+            rule-network parameters).
+        regularization_coef: Penalty coefficient that discourages the rule
+            network from producing extremely high learning rates.
+        statistics_decay: EMA decay factor for gradient-statistic tracking.
+            Closer to 1.0 → smoother / longer memory.
+    """
+    use_meta_optimizer: bool = True
+    hidden_dim: int = 128
+    num_lstm_layers: int = 2
+    max_learning_rate: float = 0.1
+    min_learning_rate: float = 1e-6
+    max_weight_decay: float = 0.1
+    meta_lr: float = 0.001
+    regularization_coef: float = 0.01
+    statistics_decay: float = 0.99
+
+
+@dataclass
 class TrainingConfig:
     """Training configuration."""
     algorithm: str = "ppo"  # ppo, sac, impala
@@ -192,6 +388,13 @@ class DeepThoughtConfig:
     planning: PlanningConfig = field(default_factory=PlanningConfig)
     meta_learning: MetaLearningConfig = field(default_factory=MetaLearningConfig)
     srp: SRPConfig = field(default_factory=SRPConfig)
+    curiosity: CuriosityConfig = field(default_factory=CuriosityConfig)
+    subgoal: SubgoalConfig = field(default_factory=SubgoalConfig)
+    opponent_modeling: OpponentModelingConfig = field(default_factory=OpponentModelingConfig)
+    hierarchical: HierarchicalConfig = field(default_factory=HierarchicalConfig)
+    compute_economy: ComputeEconomyConfig = field(default_factory=ComputeEconomyConfig)
+    attention_maps: AttentionMapsConfig = field(default_factory=AttentionMapsConfig)
+    meta_learning_rules: MetaLearningRulesConfig = field(default_factory=MetaLearningRulesConfig)
     
     # Training
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -234,6 +437,13 @@ class DeepThoughtConfig:
             "meta_learning": MetaLearningConfig,
             "srp": SRPConfig,
             "training": TrainingConfig,
+            "curiosity": CuriosityConfig,
+            "subgoal": SubgoalConfig,
+            "opponent_modeling": OpponentModelingConfig,
+            "hierarchical": HierarchicalConfig,
+            "compute_economy": ComputeEconomyConfig,
+            "attention_maps": AttentionMapsConfig,
+            "meta_learning_rules": MetaLearningRulesConfig,
         }
         
         config = cls()
