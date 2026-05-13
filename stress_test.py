@@ -913,6 +913,300 @@ def test_performance():
 
 
 # ============================================================
+# 11. Governance Architecture Stress Tests (7 Fixes)
+# ============================================================
+
+@test("Governance - Fix 1: Single dominant objective (RL primary)")
+def test_governance_single_objective():
+    from deep_thought.governance.governor import Governor, GovernorConfig
+
+    gov = Governor(GovernorConfig())
+    rl_loss = torch.tensor(1.0)
+    auxiliary = {
+        "sparsity_loss": torch.tensor(0.1),
+        "entropy": torch.tensor(0.01),
+        "load_balance": torch.tensor(0.05),
+        "world_model_loss": torch.tensor(0.3),
+        "compute_loss": torch.tensor(0.01),
+    }
+
+    total_loss, constraint_weights = gov.compute_governed_loss(rl_loss, auxiliary)
+
+    # RL loss must dominate total
+    assert isinstance(total_loss, torch.Tensor), "Total loss must be a tensor"
+    assert total_loss.item() > 0, "Total loss must be positive"
+    assert total_loss.item() >= rl_loss.item() * 0.9, "RL loss must dominate total"
+    print(f"  RL loss: {rl_loss.item():.4f}")
+    print(f"  Total governed loss: {total_loss.item():.4f}")
+    print(f"  Constraint weights: {constraint_weights}")
+
+
+@test("Governance - Fix 2: Hard time-scale separation")
+def test_governance_timescale():
+    from deep_thought.governance.timescale_controller import TimescaleController, TimescaleConfig, TimescaleTier
+
+    config = TimescaleConfig(medium_interval=10, slow_interval=100, very_slow_interval=1000)
+    tc = TimescaleController(config)
+
+    # FAST operations always allowed
+    assert tc.is_allowed("rl_policy_update", step=0)
+    assert tc.is_allowed("rl_policy_update", step=1)
+    assert tc.is_allowed("rl_policy_update", step=999)
+
+    # MEDIUM operations only at interval
+    # Step 0 has no prior execution, so medium_interval steps from -inf to 5 >= 10 is False
+    assert not tc.is_allowed("memory_consolidation", step=5), "Medium at step 5 should not be allowed (5 < 10 interval)"
+    assert tc.is_allowed("memory_consolidation", step=10), "Medium at step 10 should be allowed"
+    tc.mark_executed("memory_consolidation", step=10)
+    assert not tc.is_allowed("memory_consolidation", step=15), "Medium at step 15 should not be allowed"
+    assert tc.is_allowed("memory_consolidation", step=20), "Medium at step 20 should be allowed"
+
+    # SLOW operations only at slow interval
+    assert not tc.is_allowed("expert_pruning", step=50)
+    assert tc.is_allowed("expert_pruning", step=100)
+    tc.mark_executed("expert_pruning", step=100)
+    assert not tc.is_allowed("expert_pruning", step=150)
+    assert tc.is_allowed("expert_pruning", step=200)
+
+    # VERY_SLOW operations
+    assert not tc.is_allowed("world_model_update", step=500)
+    assert tc.is_allowed("world_model_update", step=1000)
+    print("  All timescale checks passed")
+
+
+@test("Governance - Fix 3: Capacity ledger for growth/pruning")
+def test_governance_capacity_ledger():
+    from deep_thought.governance.capacity_ledger import CapacityLedger, CapacityLedgerConfig
+
+    config = CapacityLedgerConfig(max_experts=8, min_experts=2, pruning_confirmation_window=5)
+    ledger = CapacityLedger(config)
+
+    # Register experts
+    for i in range(4):
+        ledger.register_expert(i, parameter_count=1000)
+
+    # Growth requires sufficient marginal contribution
+    assert ledger.can_grow(), "Should be able to grow (under max)"
+    assert ledger.propose_growth(predicted_marginal=0.5), "Growth with high marginal should be approved"
+    assert not ledger.propose_growth(predicted_marginal=-0.5), "Growth with negative marginal should be denied"
+
+    # Pruning requires confirmation window
+    approved, reason = ledger.propose_pruning(0)
+    assert not approved, "Should not prune immediately"
+    assert "confirmation_window" in reason or "utility" in reason or "redundancy" in reason, f"Reason should mention window, utility, or redundancy: {reason}"
+
+    # After many confirmation steps with low utility and high redundancy
+    for _ in range(10):
+        ledger.update_utility(0, 0.01)  # Very low utility
+    ledger._entries[0].redundancy_score = 0.95  # High redundancy
+    ledger._entries[0].confirmation_steps = 6  # Past window
+    approved, reason = ledger.propose_pruning(0)
+    print(f"  Pruning after confirmation: approved={approved}, reason={reason}")
+
+    budget = ledger.get_budget_summary()
+    print(f"  Budget: {budget}")
+
+
+@test("Governance - Fix 4: Decoupled routing (slow + fast gating)")
+def test_governance_decoupled_routing():
+    from deep_thought.architecture.router import SparseRouter
+    from deep_thought.config import RouterConfig
+
+    config = RouterConfig(num_experts=8, active_experts=2, hidden_dim=64)
+    router = SparseRouter(config, use_adaptive=True, latent_dim=32, context_dim=16)
+
+    h_t = torch.randn(2, 32)
+    x_t = torch.randn(2, 32)
+    m_t = torch.randn(2, 32)
+
+    # Fast path: gates should be detached (no gradient)
+    gates, indices, info = router(h_t, x_t, m_t, training=True, detach_gates=True)
+    assert not gates.requires_grad, "Fast path gates should not require grad (detached)"
+    print(f"  Fast gates require_grad: {gates.requires_grad}")
+
+    # Slow path: gates can have gradient for MEDIUM timescale update
+    gates_slow, indices_slow, info_slow = router(h_t, x_t, m_t, training=True, detach_gates=False)
+    # Note: gates may or may not require grad depending on computation graph
+    print(f"  Slow gates shape: {gates_slow.shape}")
+
+
+@test("Governance - Fix 5: Asymmetric memory read/write")
+def test_governance_asymmetric_memory():
+    from deep_thought.governance.governor import Governor, GovernorConfig
+
+    gov = Governor(GovernorConfig(memory_read_filter_threshold=0.3))
+
+    # Cheap writes: almost everything accepted
+    assert gov.approve_memory_write(importance=0.02), "Low importance write should be approved"
+    assert gov.approve_memory_write(importance=0.5), "High importance write should be approved"
+    assert not gov.approve_memory_write(importance=0.001), "Near-zero importance should be rejected"
+
+    # Expensive reads: only high relevance
+    assert gov.approve_memory_read(relevance=0.5), "High relevance read should be approved"
+    assert not gov.approve_memory_read(relevance=0.1), "Low relevance read should be rejected"
+
+    # Memory CANNOT influence pruning/growth
+    assert not gov.can_memory_influence_pruning(), "Memory must not influence pruning"
+    assert not gov.can_memory_influence_growth(), "Memory must not influence growth"
+    print("  Asymmetric memory constraints verified")
+
+
+@test("Governance - Fix 6: Non-interference rule (proposal bus)")
+def test_governance_non_interference():
+    from deep_thought.governance.proposal_bus import ProposalBus, Proposal, ProposalType, ProposalStatus
+
+    bus = ProposalBus()
+
+    # Submit proposals
+    p1 = bus.submit(Proposal(
+        proposal_type=ProposalType.PRUNE_EXPERT,
+        source="expert_bank",
+        payload={"expert_id": 3},
+        predicted_impact=0.1,
+        priority=0.5,
+        created_step=100,
+    ))
+    p2 = bus.submit(Proposal(
+        proposal_type=ProposalType.GROW_EXPERT,
+        source="expert_bank",
+        payload={"predicted_marginal": 0.5},
+        predicted_impact=0.5,
+        priority=0.8,
+        created_step=100,
+    ))
+
+    assert len(bus.get_pending()) == 2, "Should have 2 pending proposals"
+
+    # Approve one
+    approved = bus.approve(p1)
+    assert approved is not None
+    assert approved.status == ProposalStatus.APPROVED
+    assert len(bus.get_pending()) == 1
+
+    # Reject the other
+    rejected = bus.reject(p2, reason="capacity_denied")
+    assert rejected is not None
+    assert rejected.status == ProposalStatus.REJECTED
+
+    stats = bus.get_stats()
+    assert stats["total_proposed"] == 2
+    assert stats["total_approved"] == 1
+    assert stats["total_rejected"] == 1
+    print(f"  Proposal bus stats: {stats}")
+
+
+@test("Governance - Fix 7: Shared signal space normalization")
+def test_governance_signal_normalizer():
+    from deep_thought.governance.signal_normalizer import SignalNormalizer
+
+    normalizer = SignalNormalizer()
+
+    # Feed some values to build statistics
+    for i in range(50):
+        normalizer.normalize("utility", 0.5 + 0.1 * i)
+        normalizer.normalize("sparsity", 0.01 * i)
+
+    # Normalize should return finite values
+    val = normalizer.normalize("utility", 0.7)
+    assert isinstance(val, float), "Should return float"
+    assert abs(val) < 100, f"Normalized value should be reasonable, got {val}"
+
+    # Unknown signal type should work (defaults)
+    val2 = normalizer.normalize("new_signal", 1.0)
+    assert isinstance(val2, float)
+    print(f"  Normalized utility: {val:.4f}")
+    print(f"  Normalized new signal: {val2:.4f}")
+
+    stats = normalizer.get_stats()
+    assert "num_signal_types" in stats
+    print(f"  Normalizer stats: num_types={stats['num_signal_types']}")
+
+
+@test("Governance - Integrated governor with all 7 fixes")
+def test_governance_integrated():
+    from deep_thought.governance.governor import Governor, GovernorConfig
+    from deep_thought.governance.timescale_controller import TimescaleTier
+
+    gov = Governor(GovernorConfig())
+
+    # Simulate a training loop
+    for step in range(200):
+        gov.tick(step)
+
+        # Fix 1: Governed loss
+        if step % 10 == 0:
+            rl_loss = torch.tensor(1.0 + 0.01 * step)
+            aux = {"sparsity_loss": torch.tensor(0.1), "compute_loss": torch.tensor(0.01)}
+            total, weights = gov.compute_governed_loss(rl_loss, aux)
+
+        # Fix 2: Timescale checks
+        if gov.is_operation_allowed("expert_pruning"):
+            gov.mark_operation_done("expert_pruning")
+
+        if gov.is_operation_allowed("memory_consolidation"):
+            gov.mark_operation_done("memory_consolidation")
+
+    stats = gov.get_stats()
+    assert "step" in stats
+    assert "frozen" in stats
+    assert "proposal_stats" in stats
+    print(f"  Integrated governance stats: step={stats['step']}, frozen={stats['frozen']}")
+
+
+@test("Full Agent - Construction and forward with governance enabled")
+def test_agent_with_governance():
+    from deep_thought.agent import DeepThoughtAgent
+    from deep_thought.config import DeepThoughtConfig
+
+    config = DeepThoughtConfig()
+    config.observation_dim = 4
+    config.action_dim = 2
+    config.num_actions = 2
+    config.action_space = "discrete"
+    config.encoder.latent_dim = 64
+    config.encoder.hidden_dim = 128
+    config.router.num_experts = 8
+    config.router.active_experts = 2
+    config.expert.hidden_dim = 64
+    config.memory.working_memory_size = 64
+    config.memory.episodic_key_dim = 16
+    config.memory.episodic_value_dim = 64
+    config.memory.semantic_dim = 16
+    config.curiosity.state_embedding_dim = 16
+    config.hierarchical.reflex_experts = 4
+    config.hierarchical.tactical_experts = 2
+    config.hierarchical.strategic_experts = 2
+    config.hierarchical.meta_experts = 2
+    config.hierarchical.reflex_hidden_dim = 32
+    config.hierarchical.tactical_hidden_dim = 32
+    config.hierarchical.strategic_hidden_dim = 32
+    config.hierarchical.meta_hidden_dim = 32
+    config.compute_economy.bidding_hidden_dim = 16
+    config.attention_maps.num_heads = 4
+    config.attention_maps.evolution_hidden_dim = 32
+    config.subgoal.goal_embedding_dim = 16
+    config.opponent_modeling.opponent_latent_dim = 16
+    config.opponent_modeling.tendency_dim = 8
+    config.governance.use_governor = True
+
+    agent = DeepThoughtAgent(config)
+    assert agent.governor is not None, "Governor should be initialized"
+    agent.reset(1)
+    obs = torch.randn(1, 4)
+
+    # Forward pass with governance
+    outputs = agent.forward(obs, reward=0.5, training=True)
+    assert "policy_logits" in outputs
+    assert "router_info" in outputs
+
+    # Check governance stats
+    stats = agent.get_stats()
+    assert "governance_stats" in stats, "Should have governance stats"
+    print(f"  Governance stats keys: {list(stats['governance_stats'].keys())}")
+    print(f"  Agent forward with governance: OK")
+
+
+# ============================================================
 # Run All Tests
 # ============================================================
 
@@ -949,6 +1243,16 @@ if __name__ == "__main__":
         test_config_yaml,
         test_srp,
         test_performance,
+        # Governance tests (7 fixes)
+        test_governance_single_objective,
+        test_governance_timescale,
+        test_governance_capacity_ledger,
+        test_governance_decoupled_routing,
+        test_governance_asymmetric_memory,
+        test_governance_non_interference,
+        test_governance_signal_normalizer,
+        test_governance_integrated,
+        test_agent_with_governance,
     ]
 
     for fn in test_fns:

@@ -158,17 +158,13 @@ def train(
         metrics = ppo_trainer.update(optimizer, bootstrap_value=bootstrap_value)
         scheduler.step()
         
-        # Update agent systems
-        if step % config.training.prune_interval == 0 and step > 0:
-            agent.prune_experts()
-        
-        if step % config.training.growth_interval == 0 and step > 0:
-            agent.grow_experts()
-        
-        if step % 10000 == 0 and step > 0:
-            agent.consolidate_memory()
-            agent.validate_features()
-        
+        # Update agent systems (now governed by timescale controller)
+        # Fix 2: All operations respect time-scale separation via governor
+        agent.prune_experts()      # Governor checks if SLOW timescale allows
+        agent.grow_experts()       # Governor checks if SLOW timescale allows
+        agent.consolidate_memory() # Governor checks if MEDIUM timescale allows
+        agent.validate_features()  # Governor checks if SLOW timescale allows
+
         # Update SRP
         agent.update_srp(rollout_reward, metrics.get("total_loss", 0.0))
         

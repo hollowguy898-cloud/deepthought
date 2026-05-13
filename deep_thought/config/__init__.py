@@ -343,6 +343,66 @@ class MetaLearningRulesConfig:
 
 
 @dataclass
+class GovernanceConfig:
+    """Architectural Governance configuration.
+
+    Controls the 7 governance principles that impose hierarchy,
+    separation of authority, and timing discipline on the system.
+
+    Attributes:
+        use_governor: Whether to enable the governance layer.
+            If False, the system operates without governance constraints
+            (legacy mode, not recommended).
+        medium_interval: Step interval for MEDIUM-tier operations
+            (routing temperature, memory consolidation, etc.).
+        slow_interval: Step interval for SLOW-tier operations
+            (pruning, growth, architecture changes).
+        very_slow_interval: Step interval for VERY_SLOW-tier operations
+            (world model updates, representation restructuring).
+        max_total_parameters: Maximum total parameter budget across all experts.
+        max_experts: Maximum number of experts allowed.
+        min_experts: Minimum number of experts (cannot prune below this).
+        pruning_confirmation_window: Steps to confirm a pruning decision.
+        growth_marginal_threshold: Minimum predicted marginal contribution
+            required for growth approval.
+        sparsity_constraint_coef: Constraint coefficient for sparsity loss.
+        entropy_constraint_coef: Constraint coefficient for entropy loss.
+        load_balance_constraint_coef: Constraint coefficient for load balance.
+        world_model_constraint_coef: Constraint coefficient for world model.
+        compute_penalty_constraint_coef: Constraint coefficient for compute.
+        memory_read_filter_threshold: Minimum relevance for memory reads.
+        memory_influence_on_pruning: Whether memory can influence pruning
+            (default False — Fix 5).
+        memory_influence_on_growth: Whether memory can influence growth
+            (default False — Fix 5).
+    """
+    use_governor: bool = True
+    # Timescale separation
+    medium_interval: int = 100
+    slow_interval: int = 10_000
+    very_slow_interval: int = 1_000_000
+    # Capacity ledger
+    max_total_parameters: int = 100_000_000
+    max_experts: int = 256
+    min_experts: int = 4
+    pruning_confirmation_window: int = 10_000
+    growth_marginal_threshold: float = 0.1
+    pruning_utility_threshold: float = 0.05
+    redundancy_threshold: float = 0.9
+    # Constraint coefficients (Fix 1: auxiliary losses are constraints)
+    sparsity_constraint_coef: float = 0.01
+    entropy_constraint_coef: float = 0.01
+    load_balance_constraint_coef: float = 0.01
+    world_model_constraint_coef: float = 0.5
+    compute_penalty_constraint_coef: float = 0.001
+    memory_coherence_constraint_coef: float = 0.01
+    # Asymmetric memory (Fix 5)
+    memory_read_filter_threshold: float = 0.3
+    memory_influence_on_pruning: bool = False
+    memory_influence_on_growth: bool = False
+
+
+@dataclass
 class TrainingConfig:
     """Training configuration."""
     algorithm: str = "ppo"  # ppo, sac, impala
@@ -395,6 +455,7 @@ class DeepThoughtConfig:
     compute_economy: ComputeEconomyConfig = field(default_factory=ComputeEconomyConfig)
     attention_maps: AttentionMapsConfig = field(default_factory=AttentionMapsConfig)
     meta_learning_rules: MetaLearningRulesConfig = field(default_factory=MetaLearningRulesConfig)
+    governance: GovernanceConfig = field(default_factory=GovernanceConfig)
     
     # Training
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -444,6 +505,7 @@ class DeepThoughtConfig:
             "compute_economy": ComputeEconomyConfig,
             "attention_maps": AttentionMapsConfig,
             "meta_learning_rules": MetaLearningRulesConfig,
+            "governance": GovernanceConfig,
         }
         
         config = cls()
