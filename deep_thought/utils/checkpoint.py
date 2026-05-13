@@ -58,7 +58,7 @@ def load_checkpoint(
     Returns:
         checkpoint: Loaded checkpoint data
     """
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
     
     model.load_state_dict(checkpoint["model_state_dict"])
     

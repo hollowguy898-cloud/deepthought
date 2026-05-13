@@ -39,15 +39,15 @@ class WorldModel(nn.Module):
     Enables imagination-based planning and better credit assignment.
     """
     
-    def __init__(self, config: WorldModelConfig, action_dim: int):
+    def __init__(self, config: WorldModelConfig, action_dim: Optional[int]):
         super().__init__()
         self.config = config
         self.latent_dim = config.latent_dim
-        self.action_dim = action_dim
+        self.action_dim = action_dim if action_dim is not None else 1  # Default fallback
         
         # Dynamics network (z_t, a_t) -> z_{t+1}
         self.dynamics = nn.Sequential(
-            nn.Linear(config.latent_dim + action_dim, config.hidden_dim),
+            nn.Linear(config.latent_dim + self.action_dim, config.hidden_dim),
             nn.SiLU(),
             RMSNorm(config.hidden_dim),
             nn.Linear(config.hidden_dim, config.hidden_dim),
@@ -59,7 +59,7 @@ class WorldModel(nn.Module):
         # Reward predictor
         if config.predict_reward:
             self.reward_head = nn.Sequential(
-                nn.Linear(config.latent_dim + action_dim, config.hidden_dim // 2),
+                nn.Linear(config.latent_dim + self.action_dim, config.hidden_dim // 2),
                 nn.SiLU(),
                 nn.Linear(config.hidden_dim // 2, 1),
             )

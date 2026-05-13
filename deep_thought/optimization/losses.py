@@ -16,7 +16,8 @@ def compute_ppo_loss(
     returns: torch.Tensor,
     clip_eps: float = 0.2,
     value_coef: float = 0.5,
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.01,
+    entropy_mean: Optional[torch.Tensor] = None
 ) -> Dict[str, torch.Tensor]:
     """
     Compute PPO loss components.
@@ -30,6 +31,8 @@ def compute_ppo_loss(
         clip_eps: PPO clipping parameter
         value_coef: Value loss coefficient
         entropy_coef: Entropy bonus coefficient
+        entropy_mean: Precomputed entropy mean from the distribution.
+            If None, entropy is estimated from log_probs (less accurate).
         
     Returns:
         Dictionary of loss components
@@ -48,13 +51,15 @@ def compute_ppo_loss(
             returns = returns.unsqueeze(-1)
     value_loss = F.mse_loss(values, returns)
     
-    # Entropy bonus - use proper entropy computation
-    # For discrete: entropy = -sum(p * log(p))
-    # For continuous with log_probs: use -log_probs as proxy
-    # Clamp log_probs for numerical stability
-    clamped_log_probs = torch.clamp(log_probs, min=-20, max=20)
-    probs = torch.exp(clamped_log_probs)
-    entropy = -(probs * clamped_log_probs).sum(dim=-1).mean()
+    # Entropy bonus - use precomputed entropy if available, otherwise estimate
+    if entropy_mean is not None:
+        entropy = entropy_mean
+    else:
+        # Fallback: estimate entropy from action probabilities
+        # This is less accurate than using the distribution's entropy method
+        clamped_log_probs = torch.clamp(log_probs, min=-20, max=20)
+        probs = torch.exp(clamped_log_probs)
+        entropy = -(probs * clamped_log_probs).sum(dim=-1).mean()
     # Clamp entropy to prevent extreme values
     entropy = torch.clamp(entropy, min=-10, max=10)
     entropy_loss = -entropy_coef * entropy

@@ -279,8 +279,8 @@ class AdaptiveRouter(nn.Module):
         # Normalize gates
         gates = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Update info
-        info = base_info
+        # Update info (create new dict to avoid mutating base_info)
+        info = {**base_info}
         info["modified_logits"] = modified_logits
         info["adaptation"] = adaptation
         

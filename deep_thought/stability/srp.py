@@ -22,16 +22,20 @@ from deep_thought.config import SRPConfig
 from deep_thought.stability.monitoring import PerformanceMonitor
 
 
-class SelfRegressionPrevention:
+class SelfRegressionPrevention(nn.Module):
     """
     Self-Regression Prevention system.
     
     Acts as an immune system for the model, preventing
     self-inflicted damage through adaptation, pruning,
     and memory updates.
+    
+    Inherits from nn.Module so its state is properly
+    saved/loaded with model checkpoints.
     """
     
     def __init__(self, config: SRPConfig):
+        super().__init__()
         self.config = config
         self.monitor = PerformanceMonitor(config.performance_window)
         
@@ -312,5 +316,8 @@ class SelfRegressionPrevention:
         self.best_checkpoint_id = None
         self.best_performance = float('-inf')
         self.checkpoint_counter = 0
+        self.allow_pruning = True
+        self.allow_growth = True
+        self.allow_routing_changes = True
         self.expert_health = {}
         self.memory_usefulness = {}

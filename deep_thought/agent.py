@@ -122,15 +122,17 @@ class DeepThoughtAgent(nn.Module):
         self.h_t = None
         self.m_t = None
         self.context = None
+        self._prev_z_pred = None  # Previous world model prediction for error computation
         
         # Training state
         self.step = 0
     
     def reset(self, batch_size: int = 1):
-        """Reset agent state."""
+        """Reset agent state for a new episode."""
         device = next(self.parameters()).device
         self.h_t = self.memory.reset_working_memory(batch_size, device)
         self.m_t = torch.zeros(batch_size, self.config.encoder.latent_dim, device=device)
+        self._prev_z_pred = None  # Reset prediction tracking
         
         if self.meta_learning is not None:
             self.context = torch.zeros(batch_size, self.config.meta_learning.context_dim, device=device)
@@ -173,6 +175,12 @@ class DeepThoughtAgent(nn.Module):
         # Update memory
         if self.h_t is None:
             self.reset(observation.size(0))
+
+        # Detach hidden states to prevent graph leaks across steps
+        self.h_t = self.h_t.detach()
+        self.m_t = self.m_t.detach() if self.m_t is not None else self.m_t
+        if self.context is not None:
+            self.context = self.context.detach()
         
         # Safe default action tensor
         if action is not None:
@@ -203,15 +211,24 @@ class DeepThoughtAgent(nn.Module):
             write=training
         )
         self.h_t = h_t
+        # Update m_t with the actual memory read so routing uses real memory
+        self.m_t = memory_info["memory_read"]
         outputs["memory_info"] = memory_info
         
         # Get prediction error for adaptation
-        if action is not None and self.world_model is not None:
+        # Compare previous world model prediction with current latent
+        if hasattr(self, '_prev_z_pred') and self._prev_z_pred is not None and action is not None:
             with torch.no_grad():
-                z_next_pred, _, _ = self.world_model(x_t, action_input)
-                prediction_error = F.mse_loss(z_next_pred, x_t.detach())
+                prediction_error = F.mse_loss(self._prev_z_pred, x_t.detach())
         else:
             prediction_error = torch.tensor(0.0, device=observation.device)
+
+        # Store current prediction for next step comparison
+        if action is not None and self.world_model is not None:
+            with torch.no_grad():
+                self._prev_z_pred = self.world_model(x_t, action_input)[0].detach()
+        else:
+            self._prev_z_pred = None
         
         # Update context
         if self.meta_learning is not None and self.context is not None:
@@ -476,8 +493,9 @@ class DeepThoughtAgent(nn.Module):
             # Compile promoted features into experts
             if self.expert_compiler is not None:
                 for feature_id in promoted:
-                    feature = self.feature_validator.features[feature_id]
-                    self.expert_compiler.create_candidate(feature)
+                    if feature_id in self.feature_validator.features:
+                        feature = self.feature_validator.features[feature_id]
+                        self.expert_compiler.create_candidate(feature)
     
     def update_srp(
         self,

@@ -168,6 +168,10 @@ class ExpertCompiler(nn.Module):
         
         self.candidates[candidate_id] = candidate
         
+        # Register expert as a submodule so its parameters are tracked
+        # by the optimizer and moved with .to(device)
+        self.add_module(f"candidate_{candidate_id}", expert)
+        
         return candidate_id
     
     def evaluate_candidate(
@@ -236,9 +240,13 @@ class ExpertCompiler(nn.Module):
         # Check if quarantine is over and stability is good
         if candidate.quarantine_steps_remaining <= 0:
             if candidate.stability_score > 0.0:
-                # Promote
+                # Promote - delete from submodule tracking
                 expert = candidate.expert
                 del self.candidates[candidate_id]
+                # Remove from submodules
+                attr_name = f"candidate_{candidate_id}"
+                if hasattr(self, attr_name):
+                    delattr(self, attr_name)
                 return expert
         
         return None
@@ -253,6 +261,10 @@ class ExpertCompiler(nn.Module):
         
         for cid in to_remove:
             del self.candidates[cid]
+            # Remove from submodules
+            attr_name = f"candidate_{cid}"
+            if hasattr(self, attr_name):
+                delattr(self, attr_name)
     
     def split_expert(
         self,

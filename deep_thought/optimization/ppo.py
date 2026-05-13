@@ -120,7 +120,7 @@ class PPOTrainer:
         h_t,
         m_t,
         device
-    ) -> Tuple[float, int, bool]:
+    ) -> Tuple[float, int, bool, torch.Tensor]:
         """
         Collect a rollout of experience.
         
@@ -135,6 +135,7 @@ class PPOTrainer:
             total_reward: Total reward in rollout
             steps: Number of steps in this rollout
             episode_done: Whether the episode ended
+            last_observation: The last observation (after the last env.step)
         """
         total_reward = 0.0
         steps = 0
@@ -198,11 +199,16 @@ class PPOTrainer:
                 episode_done = True
                 break
         
-        return total_reward, steps, episode_done
+        return total_reward, steps, episode_done, observation
     
-    def compute_advantages(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def compute_advantages(self, bootstrap_value: float = 0.0) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute GAE advantages and returns.
+        
+        Args:
+            bootstrap_value: Value estimate for the state after the last
+                transition in the buffer. Used for bootstrapping when the
+                rollout did not end with a terminal state.
         
         Returns:
             advantages: GAE advantages
@@ -221,7 +227,7 @@ class PPOTrainer:
         for t in reversed(range(len(rewards))):
             if t == len(rewards) - 1:
                 next_non_terminal = 1.0 - dones[t]
-                next_value = 0.0
+                next_value = bootstrap_value
             else:
                 next_non_terminal = 1.0 - dones[t]
                 next_value = values[t + 1]
@@ -243,13 +249,16 @@ class PPOTrainer:
     
     def update(
         self,
-        optimizer: torch.optim.Optimizer
+        optimizer: torch.optim.Optimizer,
+        bootstrap_value: float = 0.0
     ) -> Dict[str, float]:
         """
         Update model using PPO.
         
         Args:
             optimizer: Optimizer
+            bootstrap_value: Value estimate for bootstrapping when the
+                last transition in the buffer is not terminal.
             
         Returns:
             metrics: Training metrics
@@ -257,8 +266,8 @@ class PPOTrainer:
         if len(self.buffer) == 0:
             return {"total_loss": 0.0}
         
-        # Compute advantages and returns
-        advantages, returns = self.compute_advantages()
+        # Compute advantages and returns with bootstrap
+        advantages, returns = self.compute_advantages(bootstrap_value=bootstrap_value)
         
         # Get batch
         batch = self.buffer.get_batch()
@@ -310,7 +319,12 @@ class PPOTrainer:
                 
                 value = value_output.squeeze(-1)
                 
-                # Compute PPO loss
+                # Compute PPO loss with proper entropy from the distribution
+                entropy = dist.entropy()
+                if self.action_space == "continuous":
+                    entropy = entropy.sum(dim=-1)
+                entropy_mean = entropy.mean()
+                
                 from deep_thought.optimization.losses import compute_ppo_loss
                 loss_dict = compute_ppo_loss(
                     new_log_probs,
@@ -320,7 +334,8 @@ class PPOTrainer:
                     mb_returns,
                     self.clip_eps,
                     self.value_coef,
-                    self.entropy_coef
+                    self.entropy_coef,
+                    entropy_mean=entropy_mean
                 )
                 
                 # Compute KL divergence

@@ -21,41 +21,39 @@ from deep_thought.utils.checkpoint import save_checkpoint, load_checkpoint
 
 def _get_env_info(env_id: str):
     """Get observation dim, action dim, and action space type from env."""
-    env = gym.make(env_id)
-    
-    # Observation space
-    if isinstance(env.observation_space, gym.spaces.Box):
-        if len(env.observation_space.shape) == 1:
-            observation_dim = env.observation_space.shape[0]
+    with gym.make(env_id) as env:
+        # Observation space
+        if isinstance(env.observation_space, gym.spaces.Box):
+            if len(env.observation_space.shape) == 1:
+                observation_dim = env.observation_space.shape[0]
+            else:
+                # Image observation - flatten
+                observation_dim = int(np.prod(env.observation_space.shape))
+        elif isinstance(env.observation_space, gym.spaces.Dict):
+            # Take first key
+            first_key = list(env.observation_space.spaces.keys())[0]
+            observation_dim = int(np.prod(env.observation_space[first_key].shape))
         else:
-            # Image observation - flatten
-            observation_dim = int(np.prod(env.observation_space.shape))
-    elif isinstance(env.observation_space, gym.spaces.Dict):
-        # Take first key
-        first_key = list(env.observation_space.spaces.keys())[0]
-        observation_dim = int(np.prod(env.observation_space[first_key].shape))
-    else:
-        observation_dim = 1
+            observation_dim = 1
+        
+        # Action space
+        if isinstance(env.action_space, gym.spaces.Discrete):
+            action_dim = env.action_space.n
+            num_actions = action_dim
+            action_space_type = "discrete"
+        elif isinstance(env.action_space, gym.spaces.Box):
+            action_dim = env.action_space.shape[0]
+            num_actions = action_dim * 2  # mean + log_std for continuous
+            action_space_type = "continuous"
+        elif isinstance(env.action_space, gym.spaces.MultiDiscrete):
+            action_dim = env.action_space.nvec.sum()
+            num_actions = action_dim
+            action_space_type = "discrete"
+        else:
+            action_dim = env.action_space.n
+            num_actions = action_dim
+            action_space_type = "discrete"
     
-    # Action space
-    if isinstance(env.action_space, gym.spaces.Discrete):
-        action_dim = env.action_space.n
-        num_actions = action_dim
-        action_space_type = "discrete"
-    elif isinstance(env.action_space, gym.spaces.Box):
-        action_dim = env.action_space.shape[0]
-        num_actions = action_dim * 2  # mean + log_std for continuous
-        action_space_type = "continuous"
-    elif isinstance(env.action_space, gym.spaces.MultiDiscrete):
-        action_dim = env.action_space.nvec.sum()
-        num_actions = action_dim
-        action_space_type = "discrete"
-    else:
-        action_dim = env.action_space.n
-        num_actions = action_dim
-        action_space_type = "discrete"
-    
-    env.close()
     return observation_dim, action_dim, num_actions, action_space_type
 
 
@@ -141,15 +139,23 @@ def train(
     
     for step in tqdm(range(start_step, total_steps), desc="Training"):
         # Collect rollout
-        rollout_reward, rollout_length, episode_done = ppo_trainer.collect_rollout(
+        rollout_reward, rollout_length, episode_done, last_observation = ppo_trainer.collect_rollout(
             env, observation, agent.h_t, agent.m_t, device
         )
         
         episode_reward += rollout_reward
         episode_length += rollout_length
         
+        # Compute bootstrap value for GAE when episode is not done
+        if not episode_done and len(ppo_trainer.buffer) > 0:
+            with torch.no_grad():
+                bootstrap_latent, _ = agent.encoder(last_observation)
+                bootstrap_value = agent.critic_head(bootstrap_latent).item()
+        else:
+            bootstrap_value = 0.0
+        
         # Update
-        metrics = ppo_trainer.update(optimizer)
+        metrics = ppo_trainer.update(optimizer, bootstrap_value=bootstrap_value)
         scheduler.step()
         
         # Update agent systems
@@ -178,10 +184,8 @@ def train(
             observation = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
             agent.reset(1)
         else:
-            # Get last observation from buffer - already on device from collect_rollout
-            if len(ppo_trainer.buffer) > 0:
-                last_obs = ppo_trainer.buffer.observations[-1]
-                observation = last_obs.detach()
+            # Use the actual last observation from the rollout (after the last env.step)
+            observation = last_observation.detach()
         
         # Logging
         if step % config.log_interval == 0:
@@ -189,19 +193,16 @@ def train(
             agent_stats = agent.get_stats()
             total_loss = metrics_tracker.get_metric("total_loss")
             
-            logger.info(
-                f"Step {step} | "
-                f"Reward: {episode_stats['mean_reward']:.2f} | "
-                f"Length: {episode_stats['mean_length']:.1f} | "
-                f"Experts: {agent_stats['num_experts']} | "
-                f"Active: {agent_stats['active_experts']} | "
-                f"Loss: {total_loss:.4f}" if total_loss is not None else
+            log_msg = (
                 f"Step {step} | "
                 f"Reward: {episode_stats['mean_reward']:.2f} | "
                 f"Length: {episode_stats['mean_length']:.1f} | "
                 f"Experts: {agent_stats['num_experts']} | "
                 f"Active: {agent_stats['active_experts']}"
             )
+            if total_loss is not None:
+                log_msg += f" | Loss: {total_loss:.4f}"
+            logger.info(log_msg)
         
         # Evaluation
         if step % config.eval_interval == 0 and step > 0:
