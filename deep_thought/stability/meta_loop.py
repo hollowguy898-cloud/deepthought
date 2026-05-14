@@ -280,7 +280,7 @@ class MetaActionNetwork(nn.Module):
         return raw
 
 
-class MetaLoopController:
+class MetaLoopController(nn.Module):
     """Top-level controller for the Capability Density Meta-Loop.
 
     Orchestrates:
@@ -300,6 +300,7 @@ class MetaLoopController:
     """
 
     def __init__(self, config: MetaLoopConfig, state_dim: int = 32):
+        super().__init__()
         self.config = config
         self.tracker = CapabilityDensityTracker(config)
         self.action_net = MetaActionNetwork(config, state_dim=state_dim)

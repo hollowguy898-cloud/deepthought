@@ -87,6 +87,7 @@ class VolatilityDetector:
     """
 
     def __init__(self, config: DynamicHyperparamsConfig):
+        super().__init__()
         self.config = config
         self._grad_norm_history: deque = deque(maxlen=config.volatility_window)
         self._loss_history: deque = deque(maxlen=config.volatility_window)
@@ -258,7 +259,7 @@ class MetaController(nn.Module):
         return state
 
 
-class DynamicHyperparamController:
+class DynamicHyperparamController(nn.Module):
     """Top-level controller for dynamic hyperparameter adaptation.
 
     Orchestrates:
@@ -278,6 +279,7 @@ class DynamicHyperparamController:
     """
 
     def __init__(self, config: DynamicHyperparamsConfig):
+        super().__init__()
         self.config = config
         self.volatility = VolatilityDetector(config)
         self.meta_controller = MetaController(config)

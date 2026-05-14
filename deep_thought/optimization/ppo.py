@@ -65,15 +65,31 @@ class RolloutBuffer:
     
     def get_batch(self) -> Dict:
         """Get batch as dictionary."""
+        obs = torch.stack(self.observations)
+        actions = torch.stack(self.actions)
+        latents = torch.stack(self.latents)
+        memory_reads = torch.stack(self.memory_reads)
+
+        # Squeeze out extra dimensions from single-step unsqueeze(0) during rollout
+        # obs: (T, 1, ...) -> (T, ...), actions: (T, 1) -> (T,)
+        if obs.dim() == 3 and obs.size(1) == 1:
+            obs = obs.squeeze(1)
+        if actions.dim() == 2 and actions.size(-1) == 1:
+            actions = actions.squeeze(-1)
+        if latents.dim() == 3 and latents.size(1) == 1:
+            latents = latents.squeeze(1)
+        if memory_reads.dim() == 3 and memory_reads.size(1) == 1:
+            memory_reads = memory_reads.squeeze(1)
+
         return {
-            "observations": torch.stack(self.observations),
-            "actions": torch.stack(self.actions),
+            "observations": obs,
+            "actions": actions,
             "rewards": torch.tensor(self.rewards, dtype=torch.float32),
             "dones": torch.tensor(self.dones, dtype=torch.float32),
             "log_probs": torch.stack(self.log_probs),
             "values": torch.tensor(self.values, dtype=torch.float32),
-            "latents": torch.stack(self.latents),
-            "memory_reads": torch.stack(self.memory_reads),
+            "latents": latents,
+            "memory_reads": memory_reads,
         }
     
     def __len__(self):
@@ -299,10 +315,55 @@ class PPOTrainer:
                 mb_returns = returns[mb_indices]
                 mb_latents = batch["latents"][mb_indices]
                 
-                # Forward pass
+                # Forward pass through FULL agent pipeline for gradient flow.
+                # We use a stateless forward pass that goes through encoder →
+                # router → experts → policy/value heads, but WITHOUT the
+                # agent's persistent GRU hidden state (which is batch_size=1
+                # from rollout collection and incompatible with mini-batches).
+                # This ensures router, experts, and all learnable components
+                # receive gradients during the PPO update.
+
+                # Step 1: Encode observations (gradient flows through encoder)
                 latent, _ = self.model.encoder(mb_obs)
-                policy_output = self.model.policy_head(latent)
-                value_output = self.model.critic_head(latent)
+
+                # Step 2: Route through router and experts using latent
+                mb_batch_size = mb_obs.size(0)
+                mb_device = mb_obs.device
+                mb_h_t = torch.zeros(mb_batch_size, self.model.config.encoder.latent_dim, device=mb_device)
+                mb_m_t = torch.zeros(mb_batch_size, self.model.config.encoder.latent_dim, device=mb_device)
+                mb_context = None
+                if self.model.meta_learning is not None:
+                    mb_context = torch.zeros(mb_batch_size, self.model.config.meta_learning.context_dim, device=mb_device)
+
+                # Router (gradient flows through router weights)
+                gates, selected_indices, router_info = self.model.router(
+                    mb_h_t, latent, mb_m_t, mb_context,
+                    prediction_error=None, training=True, detach_gates=False
+                )
+
+                # Experts (gradient flows through expert weights)
+                delta_h, compute_costs = self.model.expert_bank(
+                    mb_h_t, selected_indices, gates
+                )
+                h_tilde = mb_h_t + delta_h
+
+                # Hierarchical expert society (if enabled)
+                if self.model.hierarchical is not None:
+                    hierarchical_output, _ = self.model.hierarchical(
+                        h_tilde, latent, context=mb_context
+                    )
+                    h_tilde = h_tilde + hierarchical_output
+
+                # Meta-learning adaptation (if enabled)
+                if self.model.meta_learning is not None and mb_context is not None:
+                    h_adapted, _ = self.model.meta_learning.adapt(
+                        h_tilde, mb_context, gradient=None
+                    )
+                    h_tilde = h_adapted
+
+                # Policy and value heads (gradient flows through heads)
+                policy_output = self.model.policy_head(h_tilde)
+                value_output = self.model.critic_head(h_tilde)
                 
                 # Compute new log probs
                 if self.action_space == "discrete":

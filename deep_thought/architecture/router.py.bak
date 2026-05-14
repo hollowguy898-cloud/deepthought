@@ -4,14 +4,14 @@ Sparse Router module for Deep Thought.
 Implements top-k expert selection with load balancing, entropy regularization,
 and noise-augmented gating for stable sparse activation.
 
-Decoupled Routing (revised):
-  - Gradient flow through gates is enabled during TRAINING so that
-    the router and experts receive gradients from the RL loss.
-  - During INFERENCE, gates are detached to save memory (no gradient
-    needed).
-  - The "slow router update" concept is implemented via a separate
-    optimizer with a lower learning rate for router parameters, NOT
-    by detaching gates (which killed ALL gradient flow to the router).
+Fix 4: Decoupled Routing
+  - Slow router policy: The router NETWORK WEIGHTS are updated only at
+    MEDIUM timescale (controlled by Governor). No per-step gradient
+    flows through routing decisions.
+  - Fast deterministic gating: Top-k selection happens every step but
+    uses detach() on the gate values so no gradient propagates back
+    through the routing decision to the router weights during the
+    FAST forward pass.
 """
 
 import torch
@@ -74,35 +74,27 @@ class NoisyTopKRouter(nn.Module):
         x_t: torch.Tensor,
         m_t: torch.Tensor,
         training: bool = True,
-        detach_gates: bool = False
+        detach_gates: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Route to top-k experts.
 
-        By default, gate values have gradient flow enabled during training
-        so the router and experts can learn. Set detach_gates=True only
-        during inference to save memory.
+        Fix 4: By default, gate values are detached so no gradient flows
+        through the routing decision during the fast forward pass.
+        Router weights are only updated at MEDIUM timescale.
 
         Args:
             h_t: Hidden state
             x_t: Encoded observation
             m_t: Memory read
             training: Whether in training mode
-            detach_gates: Whether to detach gate values (default False for training; set True for inference)
+            detach_gates: Whether to detach gate values (Fix 4: default True)
 
         Returns:
             gates: Gate values for selected experts
             selected_indices: Indices of selected experts
             info: Routing information
         """
-        # Ensure inputs are 2D (batch, dim) — squeeze out any extra seq dim
-        if h_t.dim() == 3:
-            h_t = h_t.squeeze(1)
-        if x_t.dim() == 3:
-            x_t = x_t.squeeze(1)
-        if m_t.dim() == 3:
-            m_t = m_t.squeeze(1)
-
         # Concatenate inputs
         combined = torch.cat([h_t, x_t, m_t], dim=-1)
 
@@ -130,8 +122,9 @@ class NoisyTopKRouter(nn.Module):
         # Normalize gates
         gates = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # Detach gates only when explicitly requested (e.g. during inference).
-        # During training, gradient flows through gates so the router learns.
+        # Fix 4: Detach gate values by default to prevent gradient flow
+        # through routing decisions during FAST forward pass.
+        # Router weights are updated only at MEDIUM timescale.
         if detach_gates:
             gates = gates.detach()
 
@@ -221,13 +214,6 @@ class AdaptiveRouter(nn.Module):
 
     def _ensure_modules(self, h_t: torch.Tensor, x_t: torch.Tensor, m_t: torch.Tensor):
         """Lazily initialize context encoder and adapter."""
-        # Ensure 2D inputs
-        if h_t.dim() == 3:
-            h_t = h_t.squeeze(1)
-        if x_t.dim() == 3:
-            x_t = x_t.squeeze(1)
-        if m_t.dim() == 3:
-            m_t = m_t.squeeze(1)
         combined = torch.cat([h_t, x_t, m_t], dim=-1)
 
         if self.context_encoder is None:
@@ -251,14 +237,13 @@ class AdaptiveRouter(nn.Module):
         context: Optional[torch.Tensor] = None,
         prediction_error: Optional[torch.Tensor] = None,
         training: bool = True,
-        detach_gates: bool = False
+        detach_gates: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Route with adaptive modification.
 
-        By default, gradient flows through gates and adaptation so the
-        router and adapter can learn during training. Set detach_gates=True
-        only during inference to save memory.
+        Fix 4: Gate values are detached by default. The adapter output
+        is also detached to prevent gradient flow through the fast path.
 
         Args:
             h_t: Hidden state
@@ -267,7 +252,7 @@ class AdaptiveRouter(nn.Module):
             context: Context embedding
             prediction_error: Prediction error signal
             training: Whether in training mode
-            detach_gates: Whether to detach gates (default False for training)
+            detach_gates: Whether to detach gates (Fix 4: default True)
 
         Returns:
             gates: Gate values for selected experts
@@ -284,11 +269,7 @@ class AdaptiveRouter(nn.Module):
 
         # Encode context if not provided
         if context is None:
-            # Ensure 2D for cat
-            _h = h_t.squeeze(1) if h_t.dim() == 3 else h_t
-            _x = x_t.squeeze(1) if x_t.dim() == 3 else x_t
-            _m = m_t.squeeze(1) if m_t.dim() == 3 else m_t
-            combined = torch.cat([_h, _x, _m], dim=-1)
+            combined = torch.cat([h_t, x_t, m_t], dim=-1)
             context = self.context_encoder(combined)
 
         # Adaptation based on context and error
@@ -314,7 +295,7 @@ class AdaptiveRouter(nn.Module):
 
         adaptation = self.adapter(adapter_input)
 
-        # Detach adaptation only when explicitly requested (e.g. inference)
+        # Fix 4: Detach adaptation to prevent gradient flow in fast path
         if detach_gates:
             adaptation = adaptation.detach()
 
@@ -332,7 +313,7 @@ class AdaptiveRouter(nn.Module):
         # Normalize gates
         gates = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # Detach gates only when explicitly requested (e.g. inference)
+        # Fix 4: Detach gates in fast path
         if detach_gates:
             gates = gates.detach()
 
@@ -375,13 +356,14 @@ class SparseRouter(nn.Module):
         context: Optional[torch.Tensor] = None,
         prediction_error: Optional[torch.Tensor] = None,
         training: bool = True,
-        detach_gates: bool = False
+        detach_gates: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Route to experts.
 
-        By default, gradient flows through gates during training so
-        the router can learn. Set detach_gates=True for inference.
+        Fix 4: By default, gates are detached (no gradient through
+        routing decisions in fast path). Pass detach_gates=False
+        only during the MEDIUM timescale router weight update.
         """
         if self.use_adaptive:
             return self.router(

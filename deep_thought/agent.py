@@ -543,7 +543,8 @@ class DeepThoughtAgent(nn.Module):
             self.m_t,
             self.context,
             prediction_error,
-            training=training
+            training=training,
+            detach_gates=not training  # Gradient flows during training, detached for inference
         )
         outputs["router_info"] = router_info
         outputs["gates"] = gates

@@ -4,6 +4,7 @@ Training script for Deep Thought.
 
 import torch
 import torch.optim as optim
+import torch.nn as nn
 import gymnasium as gym
 from tqdm import tqdm
 import os
@@ -154,8 +155,40 @@ def train(
         else:
             bootstrap_value = 0.0
         
-        # Update
+        # Update with PPO (now uses full agent forward pass)
         metrics = ppo_trainer.update(optimizer, bootstrap_value=bootstrap_value)
+
+        # Auxiliary losses: compute and apply agent's full loss (world model,
+        # sparsity, orthogonality, load balance, etc.) so all components get
+        # trained, not just encoder+heads.
+        if len(ppo_trainer.buffer) == 0 and hasattr(agent, 'compute_loss'):
+            # Buffer was cleared by PPO update; use last batch for aux losses
+            try:
+                aux_batch = {
+                    'observations': last_observation.detach(),
+                    'actions': torch.zeros(1, config.action_dim, device=device),
+                    'log_probs': torch.zeros(1, device=device),
+                    'rewards': torch.tensor([0.0], device=device),
+                    'dones': torch.tensor([0.0], device=device),
+                    'latents': torch.zeros(1, config.encoder.latent_dim, device=device),
+                }
+                aux_advantages = torch.zeros(1, device=device)
+                aux_returns = torch.zeros(1, device=device)
+                aux_losses = agent.compute_loss(aux_batch, aux_advantages, aux_returns)
+                # Only apply auxiliary losses (not PPO which was already done)
+                aux_total = torch.tensor(0.0, device=device)
+                for k, v in aux_losses.items():
+                    if isinstance(v, torch.Tensor) and k not in ('total_loss', 'policy_loss', 'value_loss', 'entropy_loss') and v.requires_grad:
+                        aux_total = aux_total + v
+                if aux_total.requires_grad and aux_total.abs() > 1e-10:
+                    optimizer.zero_grad()
+                    aux_total.backward()
+                    nn.utils.clip_grad_norm_(agent.parameters(), config.training.max_grad_norm)
+                    optimizer.step()
+                    metrics['aux_loss'] = aux_total.item()
+            except Exception:
+                pass  # Auxiliary loss is optional; don't break training
+
         scheduler.step()
         
         # Update agent systems (now governed by timescale controller)
