@@ -425,6 +425,11 @@ class ShadowEvolutionConfig:
     evolution_interval: int = 1000
     max_mutations_per_cycle: int = 4
     archive_size: int = 5
+    min_shadow_age: int = 2
+    replacement_cooldown: int = 3
+    min_evaluations_before_swap: int = 3
+    fitness_ema_alpha: float = 0.1
+    max_mutation_history: int = 128
 
 
 @dataclass

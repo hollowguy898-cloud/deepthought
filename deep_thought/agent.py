@@ -283,6 +283,11 @@ class DeepThoughtAgent(nn.Module):
                     evolution_interval=config.shadow_evolution.evolution_interval,
                     max_mutations_per_cycle=config.shadow_evolution.max_mutations_per_cycle,
                     archive_size=config.shadow_evolution.archive_size,
+                    min_shadow_age=config.shadow_evolution.min_shadow_age,
+                    replacement_cooldown=config.shadow_evolution.replacement_cooldown,
+                    min_evaluations_before_swap=config.shadow_evolution.min_evaluations_before_swap,
+                    fitness_ema_alpha=config.shadow_evolution.fitness_ema_alpha,
+                    max_mutation_history=config.shadow_evolution.max_mutation_history,
                 ),
             )
         else:

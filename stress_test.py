@@ -20,6 +20,7 @@ import sys
 import traceback
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import time
 from typing import Dict, List
@@ -1620,7 +1621,7 @@ def test_agent_black_box():
 # Run All Tests
 # ============================================================
 
-if __name__ == "__main__":
+def run_all_tests():
     print("="*60)
     print("DEEP THOUGHT RL - COMPREHENSIVE STRESS TEST")
     print(f"PyTorch version: {torch.__version__}")
@@ -1654,7 +1655,6 @@ if __name__ == "__main__":
         test_config_yaml,
         test_srp,
         test_performance,
-        # Governance tests (7 fixes)
         test_governance_single_objective,
         test_governance_timescale,
         test_governance_capacity_ledger,
@@ -1664,7 +1664,6 @@ if __name__ == "__main__":
         test_governance_signal_normalizer,
         test_governance_integrated,
         test_agent_with_governance,
-        # Black Box component tests
         test_mde_invariant_detection,
         test_mde_routing_hints,
         test_mde_contradiction,
@@ -1674,6 +1673,17 @@ if __name__ == "__main__":
         test_stability_dissection_rollback,
         test_stability_scientific_method,
         test_agent_black_box,
+        test_meta_loop,
+        test_meta_loop_action,
+        test_formal_verification_syntactic,
+        test_formal_verification_kl,
+        test_formal_verification_full,
+        test_shadow_evolution,
+        test_shadow_evolution_replacement_guardrails,
+        test_shadow_mutator,
+        test_dynamic_hyperparams,
+        test_dynamic_hyperparams_meta_controller,
+        test_agent_with_stable_si,
     ]
 
     for fn in test_fns:
@@ -1863,6 +1873,8 @@ def test_shadow_evolution():
 
     # Evaluate
     should_swap, improvement = engine.evaluate_shadow(shadow_id1, 0.3, 0.5)
+    for _ in range(config.min_evaluations_before_swap - 1):
+        engine.evaluate_shadow(shadow_id1, 0.3, 0.5)
     print(f"  Shadow swap: {should_swap}, improvement: {improvement:.4f}")
 
     # Tournament select
@@ -1872,6 +1884,40 @@ def test_shadow_evolution():
 
     stats = engine.get_stats()
     print(f"  Shadow evolution stats: {stats}")
+
+
+@test("Shadow Evolution - Replacement guardrails")
+def test_shadow_evolution_replacement_guardrails():
+    from deep_thought.learning.shadow_evolution import ShadowEvolutionEngine, ShadowEvolutionConfig
+
+    config = ShadowEvolutionConfig(
+        max_shadow_experts=4,
+        mutation_rate=0.0,
+        min_shadow_age=2,
+        min_evaluations_before_swap=3,
+        replacement_cooldown=3,
+        swap_threshold=0.1,
+    )
+    engine = ShadowEvolutionEngine(config)
+    expert_state = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
+    shadow_id = engine.spawn_shadow(0, expert_state)
+
+    should_swap, _ = engine.evaluate_shadow(shadow_id, 0.3, 0.5)
+    assert not should_swap, "young shadows should not swap immediately"
+
+    engine.evolve_cycle()
+    engine.evolve_cycle()
+    engine.evaluate_shadow(shadow_id, 0.3, 0.5)
+    should_swap, _ = engine.evaluate_shadow(shadow_id, 0.3, 0.5)
+    assert should_swap, "stable evaluated shadows should be swappable"
+
+    assert engine.get_swap_state_dict(shadow_id) is not None
+    cooldown_shadow = engine.spawn_shadow(0, expert_state)
+    engine.evolve_cycle()
+    engine.evolve_cycle()
+    for _ in range(config.min_evaluations_before_swap):
+        should_swap, _ = engine.evaluate_shadow(cooldown_shadow, 0.3, 0.5)
+    assert not should_swap, "cooldown should prevent replacement churn"
 
 
 @test("Shadow Evolution - Mutator")
@@ -2019,3 +2065,7 @@ def test_agent_with_stable_si():
     print(f"  Formal verification: {stats['formal_verification_stats']}")
     print(f"  Shadow evolution: {stats['shadow_evolution_stats']}")
     print(f"  Dynamic hyperparams: {stats['dynamic_hyperparams_stats']}")
+
+
+if __name__ == "__main__":
+    run_all_tests()
