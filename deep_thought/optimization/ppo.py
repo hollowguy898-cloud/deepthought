@@ -513,8 +513,12 @@ class PPOTrainer:
                 aux_loss = torch.tensor(0.0, device=mb_device)
                 if getattr(self.model.config.world_model, "use_world_model", True):
                     wm_actions = self._world_model_actions(mb_actions, mb_device)
+                    # BUG FIX: Remove .detach() from mb_latents so the world model
+                    # receives gradient signal through the encoder. This was the #2
+                    # learning bug — the world model was completely disconnected from
+                    # the gradient graph, so it could never learn to predict next states.
                     z_pred, reward_pred, done_pred = self.model.world_model(
-                        mb_latents.detach(),
+                        mb_latents,
                         wm_actions.detach()
                     )
                     from deep_thought.optimization.losses import compute_world_model_loss
@@ -592,10 +596,10 @@ class PPOTrainer:
         #   - Rollout collection uses torch.no_grad()
         #   - PPO update creates fresh zeros for hidden states, bypassing
         #     the memory GRU entirely
-        # Fix: Do ONE forward pass through the memory system using stored
-        # memory_reads, computing an auxiliary prediction loss (predict
-        # next latent from current memory state). This gives the GRU
-        # gradients without coupling it to the policy gradient.
+        # Fix: Do a proper forward pass through the memory GRU using
+        # stored latents as input, computing an auxiliary prediction loss
+        # (predict next latent from current memory state). This gives the
+        # GRU proper gradients through its actual computation graph.
         # ---------------------------------------------------------------
         memory_loss_val = 0.0
         if (hasattr(self.model, 'memory') and 
@@ -603,16 +607,35 @@ class PPOTrainer:
             hasattr(self.model.memory.working_memory, 'gru') and
             len(batch["memory_reads"]) > 0):
             try:
+                latents = batch["latents"]       # (T, latent_dim)
                 memory_reads = batch["memory_reads"]  # (T, latent_dim)
                 next_latents = batch.get("next_latents", batch["latents"])  # (T, latent_dim)
                 
-                # One forward pass through the memory GRU
-                # Use the stored memory reads as input to predict next latent
-                h_mem = memory_reads  # Use memory reads as hidden state proxy
+                # Run the memory GRU forward with stored latents as x_t
+                # and memory_reads as the memory context. This gives the
+                # GRU proper gradient flow through its actual computation.
+                T = latents.size(0)
+                latent_dim = latents.size(-1)
+                device = latents.device
                 
-                # Simple auxiliary loss: memory should predict next latent
-                # This gives the memory GRU gradients
-                pred_loss = F.mse_loss(h_mem, next_latents.detach())
+                # BUG FIX: Initialize hidden state with batch=1 (not T).
+                # The GRU interprets h_mem as (num_layers, batch, hidden_size).
+                # gru_input has shape (T, 1, 2*latent_dim), so batch=1.
+                # Previously h_mem was (1, T, latent_dim) which caused a
+                # batch dimension mismatch that was silently caught by
+                # try/except, meaning the memory GRU NEVER trained.
+                h_mem = torch.zeros(1, 1, latent_dim, device=device)
+                
+                # Run GRU: input = [x_t, memory_read], hidden = h_mem
+                gru_input = torch.cat([latents, memory_reads], dim=-1).unsqueeze(1)  # (T, 1, 2*latent_dim)
+                gru_out, h_final = self.model.memory.working_memory.gru(
+                    gru_input, h_mem
+                )
+                gru_out = gru_out.squeeze(1)  # (T, latent_dim)
+                
+                # Auxiliary loss: memory GRU output should predict next latent
+                # This gives the GRU gradients through its computation graph
+                pred_loss = F.mse_loss(gru_out, next_latents.detach())
                 
                 # Apply a small gradient step to the memory system only
                 memory_params = list(self.model.memory.parameters())

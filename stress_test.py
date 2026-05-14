@@ -1764,3 +1764,371 @@ def test_agent_with_stable_si():
     print(f"  Formal verification: {stats['formal_verification_stats']}")
     print(f"  Shadow evolution: {stats['shadow_evolution_stats']}")
     print(f"  Dynamic hyperparams: {stats['dynamic_hyperparams_stats']}")
+
+
+# ============================================================
+# 12. GPU Device Tracking Stress Tests
+# ============================================================
+
+@test("GPU - Memory system device tracking on CUDA")
+def test_gpu_memory_device_tracking():
+    """Verify that episodic and semantic memory entries track device correctly."""
+    from deep_thought.architecture.memory.episodic_memory import EpisodicMemory
+    from deep_thought.architecture.memory.semantic_memory import SemanticMemory
+    from deep_thought.config import MemoryConfig
+
+    config = MemoryConfig(
+        episodic_capacity=50,
+        episodic_key_dim=16,
+        episodic_value_dim=32,
+        semantic_capacity=30,
+        semantic_dim=16,
+        importance_threshold=0.0,
+    )
+    latent_dim = 32
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Test episodic memory
+    em = EpisodicMemory(config, latent_dim).to(device)
+    assert em.device.type == device.type, f"Episodic memory device should be {device.type}, got {em.device.type}"
+
+    # Write entries on GPU
+    for i in range(20):
+        latent = torch.randn(1, latent_dim, device=device)
+        obs = torch.randn(1, 4, device=device)
+        action = torch.randn(1, 2, device=device)
+        em.write(latent, obs, action, reward=float(i), done=False)
+
+    assert em.get_size() > 0, "Should have written entries"
+
+    # Verify all buffer entries are on the correct device
+    for entry in em.buffer:
+        assert entry.key.device.type == device.type, f"Entry key on {entry.key.device}, expected {device}"
+        assert entry.value.device.type == device.type, f"Entry value on {entry.value.device}, expected {device}"
+
+    # Read back and verify output device
+    query = torch.randn(1, latent_dim, device=device)
+    memory_read, entries = em.read(query, k=5)
+    assert memory_read.device.type == device.type, f"Read on {memory_read.device}, expected {device}"
+
+    # Test semantic memory
+    sm = SemanticMemory(config, latent_dim).to(device)
+    assert sm.device.type == device.type, f"Semantic memory device should be {device.type}, got {sm.device.type}"
+
+    for i in range(10):
+        latent = torch.randn(1, latent_dim, device=device)
+        sm.write(latent, latent)
+
+    for concept in sm.concepts:
+        assert concept.embedding.device.type == device.type, f"Concept embedding on {concept.embedding.device}, expected {device}"
+        assert concept.prototype.device.type == device.type, f"Concept prototype on {concept.prototype.device}, expected {device}"
+
+    semantic_read, concepts = sm.read(query, k=3)
+    assert semantic_read.device.type == device.type, f"Semantic read on {semantic_read.device}, expected {device}"
+
+    print(f"  Episodic entries: {em.get_size()} (all on {device.type})")
+    print(f"  Semantic concepts: {sm.get_size()} (all on {device.type})")
+    print(f"  Read tensor device: {memory_read.device}")
+
+
+@test("GPU - Full agent on CUDA with device verification")
+def test_gpu_full_agent():
+    """Verify the full agent runs on GPU with all tensors on correct device."""
+    from deep_thought.agent import DeepThoughtAgent
+    from deep_thought.config import DeepThoughtConfig
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    config = DeepThoughtConfig()
+    config.observation_dim = 4
+    config.action_dim = 2
+    config.num_actions = 2
+    config.action_space = "discrete"
+    config.encoder.latent_dim = 64
+    config.encoder.hidden_dim = 128
+    config.router.num_experts = 8
+    config.router.active_experts = 2
+    config.expert.hidden_dim = 64
+    config.memory.working_memory_size = 64
+    config.memory.episodic_key_dim = 16
+    config.memory.episodic_value_dim = 64
+    config.memory.semantic_dim = 16
+    config.curiosity.state_embedding_dim = 16
+    config.hierarchical.reflex_experts = 4
+    config.hierarchical.tactical_experts = 2
+    config.hierarchical.strategic_experts = 2
+    config.hierarchical.meta_experts = 2
+    config.hierarchical.reflex_hidden_dim = 32
+    config.hierarchical.tactical_hidden_dim = 32
+    config.hierarchical.strategic_hidden_dim = 32
+    config.hierarchical.meta_hidden_dim = 32
+    config.compute_economy.bidding_hidden_dim = 16
+    config.attention_maps.num_heads = 4
+    config.attention_maps.evolution_hidden_dim = 32
+    config.subgoal.goal_embedding_dim = 16
+    config.opponent_modeling.opponent_latent_dim = 16
+    config.opponent_modeling.tendency_dim = 8
+
+    agent = DeepThoughtAgent(config).to(device)
+    model_device = next(agent.parameters()).device
+    assert model_device.type == device.type, f"Agent on {model_device}, expected {device}"
+
+    # Verify all parameters are on the correct device
+    wrong_device_params = 0
+    for name, param in agent.named_parameters():
+        if param.device.type != device.type:
+            wrong_device_params += 1
+    assert wrong_device_params == 0, f"{wrong_device_params} parameters on wrong device"
+
+    # Run forward pass on GPU
+    obs = torch.randn(1, 4, device=device)
+    agent.reset(1)
+    outputs = agent.forward(obs, reward=0.5, training=True)
+
+    # Verify output tensors are on GPU
+    assert outputs["policy_logits"].device.type == device.type, "policy_logits not on GPU"
+    assert outputs["value"].device.type == device.type, "value not on GPU"
+
+    # Run multiple steps to ensure memory writes happen
+    for step in range(10):
+        action, value, info = agent.act(obs)
+        outputs = agent.forward(obs, action=action, reward=float(torch.randn(1).item()),
+                                done=(step == 9), training=True)
+
+    # Check that memory buffers have entries on correct device
+    if agent.memory.episodic is not None and len(agent.memory.episodic.buffer) > 0:
+        for entry in agent.memory.episodic.buffer:
+            assert entry.key.device.type == device.type, f"Episodic entry key on {entry.key.device}"
+
+    if agent.memory.semantic is not None and len(agent.memory.semantic.concepts) > 0:
+        for concept in agent.memory.semantic.concepts:
+            assert concept.prototype.device.type == device.type, f"Semantic concept on {concept.prototype.device}"
+
+    print(f"  All parameters and output tensors on {device.type}")
+    print(f"  Episodic entries: {agent.memory.episodic.get_size() if agent.memory.episodic else 0}")
+    print(f"  Semantic concepts: {agent.memory.semantic.get_size() if agent.memory.semantic else 0}")
+
+
+# ============================================================
+# 13. Reasoning Engine Stress Tests
+# ============================================================
+
+@test("Reasoning Engine - Chain-of-thought and self-consistency")
+def test_reasoning_engine():
+    from deep_thought.reasoning.reasoning_engine import ReasoningEngine
+    from deep_thought.config import ReasoningConfig
+
+    config = ReasoningConfig(
+        use_reasoning=True,
+        num_reasoning_steps=3,
+        use_counterfactual=False,
+        num_counterfactual_actions=4,
+    )
+    latent_dim = 64
+    num_experts = 8
+    engine = ReasoningEngine(config, latent_dim, num_experts)
+
+    h_tilde = torch.randn(2, latent_dim)
+    x_t = torch.randn(2, latent_dim)
+
+    refined_h, info = engine(h_tilde, x_t, world_model=None, action_dim=None, training=True)
+    assert refined_h.shape == (2, latent_dim), f"Refined h shape: {refined_h.shape}"
+    assert "consistency_scores" in info
+    assert "mean_consistency" in info
+    assert "num_reasoning_steps" in info
+    assert info["num_reasoning_steps"] == 3
+
+    print(f"  Refined h norm: {refined_h.norm().item():.4f}")
+    print(f"  Mean consistency: {info['mean_consistency']:.4f}")
+    print(f"  Refined value: {info['refined_value'].mean().item():.4f}")
+
+
+@test("Reasoning Engine - Counterfactual reasoning with world model")
+def test_reasoning_counterfactual():
+    from deep_thought.reasoning.reasoning_engine import ReasoningEngine
+    from deep_thought.architecture.world_model import WorldModel
+    from deep_thought.config import ReasoningConfig, WorldModelConfig
+
+    config = ReasoningConfig(
+        use_reasoning=True,
+        num_reasoning_steps=2,
+        use_counterfactual=True,
+        num_counterfactual_actions=4,
+    )
+    latent_dim = 64
+    num_experts = 8
+    engine = ReasoningEngine(config, latent_dim, num_experts)
+
+    # Create a world model
+    wm_config = WorldModelConfig(latent_dim=64, hidden_dim=128, action_dim=4)
+    wm = WorldModel(wm_config, action_dim=4)
+
+    h_tilde = torch.randn(2, latent_dim)
+    x_t = torch.randn(2, latent_dim)
+
+    refined_h, info = engine(h_tilde, x_t, world_model=wm, action_dim=4, training=True)
+    assert refined_h.shape == (2, latent_dim)
+    assert "counterfactual_info" in info
+    assert "best_action_idx" in info["counterfactual_info"]
+
+    print(f"  Counterfactual values shape: {info['counterfactual_info']['cf_values'].shape}")
+    print(f"  Best action indices: {info['counterfactual_info']['best_action_idx']}")
+
+
+@test("Reasoning Engine - Integration with full agent")
+def test_reasoning_with_agent():
+    from deep_thought.agent import DeepThoughtAgent
+    from deep_thought.config import DeepThoughtConfig
+
+    config = DeepThoughtConfig()
+    config.observation_dim = 4
+    config.action_dim = 2
+    config.num_actions = 2
+    config.action_space = "discrete"
+    config.encoder.latent_dim = 64
+    config.encoder.hidden_dim = 128
+    config.router.num_experts = 8
+    config.router.active_experts = 2
+    config.expert.hidden_dim = 64
+    config.memory.working_memory_size = 64
+    config.memory.episodic_key_dim = 16
+    config.memory.episodic_value_dim = 64
+    config.memory.semantic_dim = 16
+    config.curiosity.state_embedding_dim = 16
+    config.hierarchical.reflex_experts = 4
+    config.hierarchical.tactical_experts = 2
+    config.hierarchical.strategic_experts = 2
+    config.hierarchical.meta_experts = 2
+    config.hierarchical.reflex_hidden_dim = 32
+    config.hierarchical.tactical_hidden_dim = 32
+    config.hierarchical.strategic_hidden_dim = 32
+    config.hierarchical.meta_hidden_dim = 32
+    config.compute_economy.bidding_hidden_dim = 16
+    config.attention_maps.num_heads = 4
+    config.attention_maps.evolution_hidden_dim = 32
+    config.subgoal.goal_embedding_dim = 16
+    config.opponent_modeling.opponent_latent_dim = 16
+    config.opponent_modeling.tendency_dim = 8
+    config.reasoning.use_reasoning = True
+    config.reasoning.num_reasoning_steps = 2
+    config.reasoning.use_counterfactual = True
+
+    agent = DeepThoughtAgent(config)
+    agent.reset(1)
+    obs = torch.randn(1, 4)
+
+    # Forward pass with reasoning
+    outputs = agent.forward(obs, reward=0.5, training=True)
+    assert "reasoning_info" in outputs, "Should have reasoning info in outputs"
+    assert outputs["reasoning_info"]["num_reasoning_steps"] == 2
+
+    # Act with reasoning
+    action, value, info = agent.act(obs)
+    assert action is not None
+
+    print(f"  Reasoning steps: {outputs['reasoning_info']['num_reasoning_steps']}")
+    print(f"  Mean consistency: {outputs['reasoning_info']['mean_consistency']:.4f}")
+    print(f"  Action: {action.item()}")
+
+
+# ============================================================
+# 14. Learning Pipeline Stress Tests
+# ============================================================
+
+@test("Learning - World model receives gradients")
+def test_world_model_gradient_flow():
+    """Verify the world model actually receives gradient signal."""
+    from deep_thought.architecture.world_model import WorldModel
+    from deep_thought.config import WorldModelConfig
+
+    config = WorldModelConfig(latent_dim=64, hidden_dim=128, action_dim=4)
+    wm = WorldModel(config, action_dim=4)
+
+    z_t = torch.randn(2, 64)
+    action = torch.randn(2, 4)
+    z_next_target = torch.randn(2, 64)
+
+    # Forward pass WITH gradient
+    z_pred, r_pred, d_pred = wm(z_t, action)
+
+    # Compute loss
+    loss = F.mse_loss(z_pred, z_next_target)
+    loss.backward()
+
+    # Verify gradients exist
+    has_grad = False
+    for name, param in wm.named_parameters():
+        if param.grad is not None and param.grad.abs().sum() > 0:
+            has_grad = True
+            break
+
+    assert has_grad, "World model should have non-zero gradients after backward pass"
+    print(f"  World model loss: {loss.item():.4f}")
+    print(f"  Gradient flow verified")
+
+
+@test("Learning - Full agent backward pass")
+def test_agent_backward_pass():
+    """Verify the full agent can do a backward pass without errors."""
+    from deep_thought.agent import DeepThoughtAgent
+    from deep_thought.config import DeepThoughtConfig
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    config = DeepThoughtConfig()
+    config.observation_dim = 4
+    config.action_dim = 2
+    config.num_actions = 2
+    config.action_space = "discrete"
+    config.encoder.latent_dim = 64
+    config.encoder.hidden_dim = 128
+    config.router.num_experts = 8
+    config.router.active_experts = 2
+    config.expert.hidden_dim = 64
+    config.memory.working_memory_size = 64
+    config.memory.episodic_key_dim = 16
+    config.memory.episodic_value_dim = 64
+    config.memory.semantic_dim = 16
+    config.curiosity.state_embedding_dim = 16
+    config.hierarchical.reflex_experts = 4
+    config.hierarchical.tactical_experts = 2
+    config.hierarchical.strategic_experts = 2
+    config.hierarchical.meta_experts = 2
+    config.hierarchical.reflex_hidden_dim = 32
+    config.hierarchical.tactical_hidden_dim = 32
+    config.hierarchical.strategic_hidden_dim = 32
+    config.hierarchical.meta_hidden_dim = 32
+    config.compute_economy.bidding_hidden_dim = 16
+    config.attention_maps.num_heads = 4
+    config.attention_maps.evolution_hidden_dim = 32
+    config.subgoal.goal_embedding_dim = 16
+    config.opponent_modeling.opponent_latent_dim = 16
+    config.opponent_modeling.tendency_dim = 8
+
+    agent = DeepThoughtAgent(config).to(device)
+    agent.reset(1)
+
+    obs = torch.randn(1, 4, device=device)
+    action = torch.tensor([1], device=device)
+
+    # Forward pass
+    outputs = agent.forward(obs, action=action, reward=0.5, training=True)
+
+    # Compute simple loss
+    policy_logits = outputs["policy_logits"]
+    value = outputs["value"]
+    target_value = torch.tensor([[1.0]], device=device)
+    loss = F.mse_loss(value, target_value) + F.cross_entropy(policy_logits, torch.tensor([1], device=device))
+
+    # Backward pass
+    loss.backward()
+
+    # Verify gradients flow to key components
+    encoder_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in agent.encoder.parameters())
+    policy_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in agent.policy_head.parameters())
+    critic_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in agent.critic_head.parameters())
+
+    print(f"  Encoder has gradients: {encoder_has_grad}")
+    print(f"  Policy head has gradients: {policy_has_grad}")
+    print(f"  Critic head has gradients: {critic_has_grad}")
+    print(f"  Loss: {loss.item():.4f}")

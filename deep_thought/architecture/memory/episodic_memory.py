@@ -3,6 +3,11 @@ Episodic memory module for Deep Thought.
 
 Implements key-value memory for storing and retrieving specific experiences.
 Stores high-reward events, high prediction error events, and novel trajectories.
+
+GPU FIX: All buffer entries are stored on a tracked device.
+Since Python list buffers are invisible to PyTorch's .to(device),
+we maintain a self.device reference and ensure all tensors in
+buffer entries are on the correct device at write and read time.
 """
 
 import torch
@@ -40,6 +45,11 @@ class EpisodicMemory(nn.Module):
     - Failure states
     
     Uses attention-based retrieval.
+    
+    GPU FIX: All buffer entries are stored on a tracked device.
+    Since Python list buffers are invisible to PyTorch's .to(device),
+    we maintain a self.device reference and ensure all tensors in
+    buffer entries are on the correct device at write and read time.
     """
     
     def __init__(self, config: MemoryConfig, latent_dim: int = 1024):
@@ -64,7 +74,18 @@ class EpisodicMemory(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 1),
         )
+        
+        # GPU FIX: Track device for buffer entries.
+        # Since self.buffer is a plain Python list, calling model.to(device)
+        # will NOT move the tensors inside buffer entries. We track the
+        # device explicitly and move tensors at write/read boundaries.
+        self.register_buffer('_device_tracker', torch.zeros(1))
     
+    @property
+    def device(self):
+        """Return the device this module's parameters are on."""
+        return self._device_tracker.device
+
     def compute_importance(
         self,
         latent: torch.Tensor,
@@ -74,6 +95,9 @@ class EpisodicMemory(nn.Module):
     ) -> float:
         """
         Compute importance score for memory entry.
+        
+        GPU FIX: Create the scalar features tensor on the same device
+        as the latent to avoid CPU-GPU mismatch.
         
         Args:
             latent: Latent representation
@@ -91,6 +115,7 @@ class EpisodicMemory(nn.Module):
             else:
                 latent_flat = latent
             
+            # GPU FIX: Explicitly create scalars on latent's device
             features = torch.cat([
                 latent_flat,
                 torch.tensor([reward, prediction_error, novelty], device=latent.device)
@@ -111,6 +136,11 @@ class EpisodicMemory(nn.Module):
         """
         Write entry to episodic memory if important enough.
         
+        GPU FIX: All stored tensors are explicitly moved to the model's
+        tracked device. Since self.buffer is a plain Python list, calling
+        model.to(device) will NOT move the tensors inside buffer entries.
+        We ensure they're on the correct device at write time.
+        
         Args:
             latent: Latent representation
             observation: Observation
@@ -130,9 +160,13 @@ class EpisodicMemory(nn.Module):
             return
         
         # Create entry - handle batch dimension gracefully
+        # GPU FIX: Ensure all stored tensors are on the model's tracked device.
+        # Since self.buffer is a plain Python list, model.to(device) won't
+        # move these tensors. We explicitly move them here.
+        target_device = self.device
         with torch.no_grad():
-            key = self.key_proj(latent.detach())
-            value = self.value_proj(latent.detach())
+            key = self.key_proj(latent.detach()).to(target_device)
+            value = self.value_proj(latent.detach()).to(target_device)
             
             # Squeeze batch dimension if present
             if key.dim() > 1 and key.size(0) == 1:
@@ -140,11 +174,11 @@ class EpisodicMemory(nn.Module):
             if value.dim() > 1 and value.size(0) == 1:
                 value = value.squeeze(0)
             
-            obs_detached = observation.detach()
+            obs_detached = observation.detach().to(target_device)
             if obs_detached.dim() > 1 and obs_detached.size(0) == 1:
                 obs_detached = obs_detached.squeeze(0)
             
-            act_detached = action.detach()
+            act_detached = action.detach().to(target_device)
             if act_detached.dim() > 1 and act_detached.size(0) == 1:
                 act_detached = act_detached.squeeze(0)
         
@@ -173,6 +207,10 @@ class EpisodicMemory(nn.Module):
         """
         Retrieve k most relevant memories.
         
+        GPU FIX: Stacked buffer tensors are moved to query.device at read
+        time to handle cases where the model was moved after entries were
+        written.
+        
         Args:
             query: Query latent
             k: Number of memories to retrieve
@@ -195,11 +233,16 @@ class EpisodicMemory(nn.Module):
             else:
                 q_search = q
         
+        # GPU FIX: Move q_search to same device as buffer keys for comparison.
+        # Buffer keys are on self.device; q_search is on query.device.
+        # They must match for cosine_similarity.
+        key_device = self.buffer[0].key.device
+        
         # Compute similarities
         similarities = []
         for entry in self.buffer:
             sim = F.cosine_similarity(
-                q_search.unsqueeze(0),
+                q_search.unsqueeze(0).to(key_device),
                 entry.key.unsqueeze(0),
                 dim=-1
             ).item()
@@ -219,8 +262,11 @@ class EpisodicMemory(nn.Module):
         similarities_k = [max(0.0, similarities[i]) for i in top_k_indices]
         attention = F.softmax(torch.tensor(similarities_k, dtype=torch.float32, device=query.device), dim=0)
         
-        # Aggregate values
-        values = torch.stack([entry.value for entry in entries])
+        # GPU FIX: Stack buffer tensors and move to query device.
+        # Buffer entries may be on a different device if the model was
+        # moved after entries were written. Always ensure read tensors
+        # are on the same device as the query.
+        values = torch.stack([entry.value for entry in entries]).to(query.device)
         memory_read = (attention.unsqueeze(-1) * values).sum(dim=0, keepdim=True)
         
         # Expand to match batch dimension

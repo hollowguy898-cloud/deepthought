@@ -239,8 +239,13 @@ class MetaController(nn.Module):
         active_expert_ratio: float = 0.5,
         compute_budget_used: float = 0.5,
         warmup_phase: float = 0.0,
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """Encode system state into a vector for the meta-controller.
+
+        BUG FIX: Added device parameter so the state tensor is created
+        on the same device as the meta_controller, avoiding CPU-GPU
+        mismatch errors.
 
         Returns:
             state: (1, input_dim) tensor.
@@ -254,12 +259,18 @@ class MetaController(nn.Module):
             active_expert_ratio,
             compute_budget_used,
             warmup_phase,
-        ]], dtype=torch.float32)
+        ]], dtype=torch.float32, device=device)
         return state
 
 
-class DynamicHyperparamController:
+class DynamicHyperparamController(nn.Module):
     """Top-level controller for dynamic hyperparameter adaptation.
+
+    BUG FIX: This class MUST inherit from nn.Module so that:
+    1. model.to(device) / model.cuda() moves meta_controller to GPU
+    2. model.parameters() includes meta_controller's parameters for optimization
+    Without nn.Module, the meta_controller network is orphaned — it stays on
+    CPU and never receives gradient updates.
 
     Orchestrates:
       1. Volatility detection (gradient and loss)
@@ -278,6 +289,7 @@ class DynamicHyperparamController:
     """
 
     def __init__(self, config: DynamicHyperparamsConfig):
+        super().__init__()
         self.config = config
         self.volatility = VolatilityDetector(config)
         self.meta_controller = MetaController(config)
@@ -363,6 +375,8 @@ class DynamicHyperparamController:
             }
 
         # Query meta-controller
+        # BUG FIX: Get device from meta_controller to avoid CPU-GPU mismatch
+        mc_device = next(self.meta_controller.parameters()).device
         state = MetaController.encode_state(
             grad_volatility=vol["grad_volatility"],
             loss_volatility=vol["loss_volatility"],
@@ -372,6 +386,7 @@ class DynamicHyperparamController:
             active_expert_ratio=active_expert_count / max(1, max_experts),
             compute_budget_used=compute_budget_used,
             warmup_phase=0.0,
+            device=mc_device,
         )
 
         with torch.no_grad():

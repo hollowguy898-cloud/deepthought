@@ -463,12 +463,22 @@ class DeepThoughtAgent(nn.Module):
             elementwise_pred_error = torch.zeros_like(x_t)
             prediction_error = torch.tensor(0.0, device=observation.device)
 
-        # Store current prediction for next step comparison
+        # Store current prediction for next step comparison.
+        # BUG FIX: The world model was previously computed inside
+        # torch.no_grad(), which meant the world model NEVER received
+        # gradient signal during the main forward pass. Now we compute
+        # the prediction WITH gradient flow so the world model learns
+        # from the main forward pass too. We detach only the stored
+        # _prev_z_pred to prevent graph leaks across steps.
+        # Also cache the full output to avoid redundant computation below.
         if action is not None and self.world_model is not None:
-            with torch.no_grad():
-                self._prev_z_pred = self.world_model(x_t, action_input)[0].detach()
+            z_pred_current, r_pred_current, d_pred_current = self.world_model(x_t, action_input)
+            self._prev_z_pred = z_pred_current.detach()
+            # Cache for reuse in the "World model prediction" section below
+            self._wm_cache = (z_pred_current, r_pred_current, d_pred_current)
         else:
             self._prev_z_pred = None
+            self._wm_cache = None
 
         # --- Attention Probability Maps ---
         # Weight the latent by attention before routing
@@ -672,14 +682,30 @@ class DeepThoughtAgent(nn.Module):
         outputs["policy_logits"] = policy_logits
         outputs["value"] = value
 
-        # World model prediction
+        # World model prediction — reuse the computation from earlier if available.
+        # BUG FIX: Previously, the world model was computed TWICE with identical inputs:
+        #   1. At line ~473 for prediction error tracking (result immediately detached)
+        #   2. Here for the outputs dict (result used in losses)
+        # The first call created an orphaned gradient graph that wasted compute.
+        # Now we store the result from the first call and reuse it here.
         if self.world_model is not None and action is not None:
-            z_next, r_pred, d_pred = self.world_model(x_t, action_input)
-            outputs["world_model"] = {
-                "z_next": z_next,
-                "r_pred": r_pred,
-                "d_pred": d_pred,
-            }
+            if hasattr(self, '_wm_cache') and self._wm_cache is not None:
+                # Reuse cached result from prediction error computation
+                z_next, r_pred, d_pred = self._wm_cache
+                outputs["world_model"] = {
+                    "z_next": z_next,
+                    "r_pred": r_pred,
+                    "d_pred": d_pred,
+                }
+                self._wm_cache = None  # Clear cache
+            else:
+                # Fallback: compute if cache was cleared
+                z_next, r_pred, d_pred = self.world_model(x_t, action_input)
+                outputs["world_model"] = {
+                    "z_next": z_next,
+                    "r_pred": r_pred,
+                    "d_pred": d_pred,
+                }
 
         # Feature extraction
         if self.feature_validator is not None and training:

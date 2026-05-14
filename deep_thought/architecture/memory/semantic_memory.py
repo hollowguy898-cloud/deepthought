@@ -3,6 +3,11 @@ Semantic memory module for Deep Thought.
 
 Implements compressed knowledge storage for generalized world structure,
 abstract rules, and learned invariants.
+
+GPU FIX: All concept tensors are stored on a tracked device.
+Since Python list buffers are invisible to PyTorch's .to(device),
+we maintain a self.device reference and ensure all tensors in
+concept entries are on the correct device at write and read time.
 """
 
 import torch
@@ -33,6 +38,11 @@ class SemanticMemory(nn.Module):
     - Learned invariants
     
     Updated via slow consolidation from episodic memory.
+    
+    GPU FIX: All concept tensors are stored on a tracked device.
+    Since Python list concepts are invisible to PyTorch's .to(device),
+    we maintain a self.device reference and ensure all tensors in
+    concept entries are on the correct device at write and read time.
     """
     
     def __init__(self, config: MemoryConfig, latent_dim: int = 1024):
@@ -54,7 +64,18 @@ class SemanticMemory(nn.Module):
         
         # Consolidation rate
         self.consolidation_rate = config.consolidation_rate
+        
+        # GPU FIX: Track device for concept entries.
+        # Since self.concepts is a plain Python list, calling model.to(device)
+        # will NOT move the tensors inside concept entries. We track the
+        # device explicitly and move tensors at write/read boundaries.
+        self.register_buffer('_device_tracker', torch.zeros(1))
     
+    @property
+    def device(self):
+        """Return the device this module's parameters are on."""
+        return self._device_tracker.device
+
     def write(
         self,
         latent: torch.Tensor,
@@ -63,16 +84,25 @@ class SemanticMemory(nn.Module):
         """
         Write to semantic memory (consolidation).
         
+        GPU FIX: All stored tensors are explicitly moved to the model's
+        tracked device. Since self.concepts is a plain Python list,
+        model.to(device) will NOT move the tensors inside concept entries.
+        We ensure they're on the correct device at write time.
+        
         Args:
             latent: Latent representation
             observation: Observation
         """
+        target_device = self.device
+        
         # Encode to concept
         with torch.no_grad():
             embedding = self.concept_encoder(latent)
             # Handle batch dimension - take first element
             if embedding.dim() > 1:
                 embedding = embedding[0]
+            # GPU FIX: Ensure embedding is on tracked device
+            embedding = embedding.to(target_device)
         
         # Check for similar existing concept
         similar_idx = self._find_similar(embedding)
@@ -87,7 +117,7 @@ class SemanticMemory(nn.Module):
         else:
             # Create new concept
             with torch.no_grad():
-                prototype = latent.detach()
+                prototype = latent.detach().to(target_device)
                 if prototype.dim() > 1:
                     prototype = prototype[0]
             
@@ -120,6 +150,10 @@ class SemanticMemory(nn.Module):
         """
         Retrieve relevant concepts.
         
+        GPU FIX: Stacked concept tensors are moved to query.device at read
+        time to handle cases where the model was moved after concepts were
+        written.
+        
         Args:
             query: Query latent
             k: Number of concepts to retrieve
@@ -142,11 +176,14 @@ class SemanticMemory(nn.Module):
             else:
                 q_search = q
         
+        # GPU FIX: Move q_search to same device as concept embeddings
+        embedding_device = self.concepts[0].embedding.device
+        
         # Compute similarities
         similarities = []
         for concept in self.concepts:
             sim = F.cosine_similarity(
-                q_search.unsqueeze(0),
+                q_search.unsqueeze(0).to(embedding_device),
                 concept.embedding.unsqueeze(0),
                 dim=-1
             ).item()
@@ -167,8 +204,11 @@ class SemanticMemory(nn.Module):
         weights = torch.tensor(similarities_k, dtype=torch.float32, device=query.device) * torch.tensor(strengths, dtype=torch.float32, device=query.device)
         weights = F.softmax(weights, dim=0)
         
-        # Aggregate prototypes
-        prototypes = torch.stack([c.prototype for c in retrieved])
+        # GPU FIX: Stack concept prototypes and move to query device.
+        # Concept entries may be on a different device if the model was
+        # moved after concepts were written. Always ensure read tensors
+        # are on the same device as the query.
+        prototypes = torch.stack([c.prototype for c in retrieved]).to(query.device)
         semantic_read = (weights.unsqueeze(-1) * prototypes).sum(dim=0, keepdim=True)
         
         # Expand to match batch dimension
@@ -184,8 +224,9 @@ class SemanticMemory(nn.Module):
     ) -> Optional[int]:
         """Find similar existing concept."""
         for i, concept in enumerate(self.concepts):
+            # GPU FIX: Move embedding to concept's device for comparison
             sim = F.cosine_similarity(
-                embedding.unsqueeze(0),
+                embedding.unsqueeze(0).to(concept.embedding.device),
                 concept.embedding.unsqueeze(0),
                 dim=-1
             ).item()

@@ -76,7 +76,13 @@ def train(
     logger = setup_logger("deep_thought", config.log_dir)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     
+    # GPU VERIFICATION: Log detailed device info so we can confirm GPU usage
     logger.info(f"Training on device: {device}")
+    if device.type == "cuda":
+        logger.info(f"  CUDA device: {torch.cuda.get_device_name(0)}")
+        logger.info(f"  CUDA memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    else:
+        logger.warning("WARNING: Training on CPU! Set config.device='cuda' and ensure CUDA is available.")
     logger.info(f"Environment: {env_id}")
     
     # Create environment to get info
@@ -95,7 +101,20 @@ def train(
     # Create agent
     agent = DeepThoughtAgent(config).to(device)
     
+    # GPU VERIFICATION: Confirm model is on GPU
+    model_device = next(agent.parameters()).device
     logger.info(f"Agent created with {sum(p.numel() for p in agent.parameters())} parameters")
+    logger.info(f"Agent device: {model_device}")
+    if model_device.type != device.type:
+        logger.warning(f"WARNING: Agent is on {model_device} but expected {device}!")
+    
+    # Verify all submodules are on the correct device
+    for name, param in agent.named_parameters():
+        if param.device.type != device.type:
+            logger.warning(f"  Parameter {name} on {param.device} (expected {device})")
+            break
+    else:
+        logger.info(f"All {sum(1 for _ in agent.parameters())} parameter tensors on {device}")
     
     # Create optimizer
     optimizer = optim.Adam(

@@ -268,11 +268,11 @@ class MetaActionNetwork(nn.Module):
             mean_utility,
             memory_utilization,
             compute_budget_used,
-        ]], dtype=torch.float32)
+        ]], dtype=torch.float32, device=next(self.parameters()).device)
 
         # Pad or project to state_dim
         if raw.size(-1) < self.state_dim:
-            padding = torch.zeros(1, self.state_dim - raw.size(-1))
+            padding = torch.zeros(1, self.state_dim - raw.size(-1), device=raw.device)
             raw = torch.cat([raw, padding], dim=-1)
         elif raw.size(-1) > self.state_dim:
             raw = raw[:, :self.state_dim]
@@ -280,8 +280,14 @@ class MetaActionNetwork(nn.Module):
         return raw
 
 
-class MetaLoopController:
+class MetaLoopController(nn.Module):
     """Top-level controller for the Capability Density Meta-Loop.
+
+    BUG FIX: This class MUST inherit from nn.Module so that:
+    1. model.to(device) / model.cuda() moves action_net to GPU
+    2. model.parameters() includes action_net's parameters for optimization
+    Without nn.Module, the action_net is orphaned — it stays on CPU and
+    never receives gradient updates.
 
     Orchestrates:
       1. Density tracking and regression detection
@@ -300,6 +306,7 @@ class MetaLoopController:
     """
 
     def __init__(self, config: MetaLoopConfig, state_dim: int = 32):
+        super().__init__()
         self.config = config
         self.tracker = CapabilityDensityTracker(config)
         self.action_net = MetaActionNetwork(config, state_dim=state_dim)
