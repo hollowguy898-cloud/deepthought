@@ -43,6 +43,8 @@ from deep_thought.stability.meta_loop import MetaLoopController, MetaLoopConfig
 from deep_thought.learning.formal_verification import FormalVerificationLayer, FormalVerificationConfig
 from deep_thought.learning.shadow_evolution import ShadowEvolutionEngine, ShadowEvolutionConfig
 from deep_thought.learning.dynamic_hyperparams import DynamicHyperparamController, DynamicHyperparamsConfig
+from deep_thought.mechanic_discovery.mde import MechanicDiscoveryEngine
+from deep_thought.learning.autonomous_specialization import AutonomousSpecialization
 
 
 class DeepThoughtAgent(nn.Module):
@@ -65,6 +67,9 @@ class DeepThoughtAgent(nn.Module):
     - Stable self-improvement: Formal Verification Layer
     - Stable self-improvement: Shadow Evolution
     - Stable self-improvement: Dynamic Hyperparameter Adaptation
+    - Black Box: Mechanic Discovery Engine (MDE)
+    - Black Box: Autonomous Expert Specialization
+    - Black Box: Stability in the Dark (SRP enhancements)
     """
 
     def __init__(self, config: DeepThoughtConfig):
@@ -306,6 +311,31 @@ class DeepThoughtAgent(nn.Module):
             )
         else:
             self.dynamic_hyperparams = None
+
+        # -----------------------------------------------------------
+        # Black Box Components
+        # -----------------------------------------------------------
+
+        # Component 5: Mechanic Discovery Engine (MDE)
+        if config.mechanic_discovery.use_mde:
+            self.mde = MechanicDiscoveryEngine(
+                config.mechanic_discovery
+            )
+        else:
+            self.mde = None
+
+        # Component 6: Autonomous Expert Specialization
+        if config.autonomous_specialization.use_autonomous_specialization:
+            self.autonomous_specialization = AutonomousSpecialization(
+                config.autonomous_specialization
+            )
+        else:
+            self.autonomous_specialization = None
+
+        # Component 7: Stability in the Dark (enhancements to SRP)
+        # This is configured through config.stability_in_the_dark but
+        # the actual logic is already in self.srp
+        self.stability_in_the_dark_config = config.stability_in_the_dark
 
         # Policy and value heads
         # For continuous action space, policy head outputs mean + log_std (2 * action_dim)
@@ -701,6 +731,42 @@ class DeepThoughtAgent(nn.Module):
                 loss=loss_proxy,
                 prediction_error=loss_proxy,
             )
+
+        # -------------------------------------------------------
+        # Black Box: Mechanic Discovery Engine
+        # -------------------------------------------------------
+        if self.mde is not None and training and action is not None:
+            # Process step through MDE
+            mde_context = self.context if self.context is not None else x_t.mean(dim=0)
+            if mde_context.dim() == 2:
+                mde_context = mde_context[0]  # Take first in batch
+            mde_action = action_input[0] if action_input.dim() == 2 else action_input
+            mde_obs = x_t[0].detach()
+
+            active_tags, routing_hints = self.mde.process_step(
+                action=mde_action.detach(),
+                observation=mde_obs,
+                context=mde_context.detach(),
+                reward=reward if reward is not None else 0.0,
+            )
+            outputs["mde_active_tags"] = active_tags
+            outputs["mde_routing_hints"] = routing_hints
+
+            # Update expert affinities in MDE based on routing results
+            if active_tags and "selected_indices" in outputs:
+                for tag in active_tags:
+                    for k in range(selected_indices.size(1)):
+                        for idx in selected_indices[:, k].unique().tolist():
+                            expert_success = gates[0, k].item() if gates.size(0) > 0 else 0.5
+                            self.mde._labeler.update_expert_affinity(
+                                tag.tag_id, idx, expert_success
+                            )
+
+        # -------------------------------------------------------
+        # Stability in the Dark: Density Gate Tick
+        # -------------------------------------------------------
+        if self.srp is not None and hasattr(self.srp, 'tick_density_gate'):
+            self.srp.tick_density_gate()
 
         # Update step
         self.step += 1

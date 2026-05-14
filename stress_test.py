@@ -1207,6 +1207,316 @@ def test_agent_with_governance():
 
 
 # ============================================================
+# 12. Mechanic Discovery Engine (MDE) Stress Tests
+# ============================================================
+
+@test("MDE - Invariant detection and self-labeling")
+def test_mde_invariant_detection():
+    from deep_thought.mechanic_discovery.mde import MechanicDiscoveryEngine, MechanicDiscoveryConfig
+
+    config = MechanicDiscoveryConfig(
+        use_mde=True,
+        observation_dim=32,
+        action_dim=4,
+        context_dim=16,
+        stability_threshold=0.7,
+        min_context_span=2,
+        window_size=100,
+        validation_interval=50,
+    )
+    mde = MechanicDiscoveryEngine(config)
+
+    # Simulate steps with a consistent action-observation pattern
+    for step in range(50):
+        action = torch.tensor([1.0, 0.0, 0.0, 0.0])  # Consistent action
+        obs = torch.randn(32) * 0.1 + torch.tensor([1.0] * 32)  # Consistent effect
+        context = torch.randn(16) * (1.0 + step * 0.1)  # Varying context
+        reward = 1.0
+
+        tags, hints = mde.process_step(action, obs, context, reward)
+
+    # After enough steps with consistent patterns, mechanics may be discovered
+    stats = mde.get_stats()
+    print(f"  MDE stats: {stats}")
+    assert isinstance(tags, list)
+    assert isinstance(hints, dict)
+
+
+@test("MDE - Routing hints and expert affinities")
+def test_mde_routing_hints():
+    from deep_thought.mechanic_discovery.mde import MechanicDiscoveryEngine, MechanicDiscoveryConfig, MechanicTag
+
+    config = MechanicDiscoveryConfig(
+        use_mde=True,
+        observation_dim=16,
+        action_dim=2,
+        context_dim=8,
+        stability_threshold=0.5,
+        min_context_span=2,
+        window_size=50,
+    )
+    mde = MechanicDiscoveryEngine(config)
+
+    # Process steps
+    for step in range(30):
+        action = torch.randn(2)
+        obs = torch.randn(16)
+        context = torch.randn(8)
+        tags, hints = mde.process_step(action, obs, context, reward=0.5)
+
+    # Test get_routing_hints directly
+    empty_hints = mde.get_routing_hints([])
+    assert empty_hints == {}, f"Empty tags should give empty hints, got {empty_hints}"
+    print(f"  Routing hints work correctly")
+
+
+@test("MDE - Mechanic contradiction and validation")
+def test_mde_contradiction():
+    from deep_thought.mechanic_discovery.mde import MechanicDiscoveryEngine, MechanicDiscoveryConfig
+
+    config = MechanicDiscoveryConfig(
+        use_mde=True,
+        observation_dim=16,
+        action_dim=2,
+        context_dim=8,
+        stability_threshold=0.5,
+        min_context_span=2,
+        window_size=50,
+        contradiction_threshold=0.3,
+        validation_interval=10,
+    )
+    mde = MechanicDiscoveryEngine(config)
+
+    # Process enough steps to potentially discover mechanics
+    for step in range(60):
+        action = torch.tensor([1.0, 0.0])
+        obs = torch.randn(16) + 0.5
+        context = torch.randn(8) * (step + 1)
+        tags, hints = mde.process_step(action, obs, context, reward=1.0)
+
+    # Test contradiction method
+    mde.contradict_mechanic(0)
+    stats = mde.get_stats()
+    print(f"  MDE stats after contradiction: {stats}")
+
+
+# ============================================================
+# 13. Autonomous Expert Specialization Stress Tests
+# ============================================================
+
+@test("Autonomous Specialization - Growth trigger and tracking")
+def test_autonomous_specialization_growth():
+    from deep_thought.learning.autonomous_specialization import AutonomousSpecialization, AutonomousSpecializationConfig
+
+    config = AutonomousSpecializationConfig(
+        use_autonomous_specialization=True,
+        growth_confidence_threshold=0.8,
+        growth_context_span_min=3,
+        max_specialists_per_mechanic=2,
+    )
+    spec = AutonomousSpecialization(config)
+
+    # Should trigger growth for high-confidence mechanic with no expert
+    should_grow = spec.should_trigger_growth(
+        mechanic_tag_id="Mechanic_001",
+        invariant_confidence=0.9,
+        invariant_context_span=5,
+        has_matching_expert=False,
+    )
+    assert should_grow, "Should trigger growth for high-confidence invariant"
+
+    # Should NOT trigger growth for low-confidence
+    should_grow_low = spec.should_trigger_growth(
+        mechanic_tag_id="Mechanic_002",
+        invariant_confidence=0.5,
+        invariant_context_span=5,
+        has_matching_expert=False,
+    )
+    assert not should_grow_low, "Should NOT trigger growth for low-confidence"
+
+    # Should NOT trigger when expert already exists
+    should_grow_exists = spec.should_trigger_growth(
+        mechanic_tag_id="Mechanic_001",
+        invariant_confidence=0.9,
+        invariant_context_span=5,
+        has_matching_expert=True,
+    )
+    assert not should_grow_exists, "Should NOT trigger when expert exists"
+
+    # Record a specialist
+    spec.record_specialist(
+        expert_id=10,
+        mechanic_tag_id="Mechanic_001",
+        invariant_id=1,
+        parent_expert_id=5,
+    )
+    assert spec.has_specialist_for_mechanic("Mechanic_001")
+    print(f"  Specialization stats: {spec.get_stats()}")
+
+
+@test("Autonomous Specialization - Contradiction-based pruning")
+def test_autonomous_specialization_contradiction():
+    from deep_thought.learning.autonomous_specialization import AutonomousSpecialization, AutonomousSpecializationConfig
+
+    config = AutonomousSpecializationConfig(
+        use_autonomous_specialization=True,
+        contradiction_prune_threshold=0.2,
+    )
+    spec = AutonomousSpecialization(config)
+
+    # Create specialists
+    spec.record_specialist(expert_id=10, mechanic_tag_id="Mech_001", invariant_id=1, parent_expert_id=5)
+    spec.record_specialist(expert_id=11, mechanic_tag_id="Mech_001", invariant_id=1, parent_expert_id=5)
+
+    # Handle contradiction
+    prune_ids = spec.handle_contradiction("Mech_001")
+    assert len(prune_ids) == 2, f"Should prune 2 specialists, got {len(prune_ids)}"
+    assert 10 in prune_ids and 11 in prune_ids
+
+    # After contradiction, no active specialists
+    assert not spec.has_specialist_for_mechanic("Mech_001")
+    print(f"  Pruned expert IDs: {prune_ids}")
+
+
+# ============================================================
+# 14. Stability in the Dark Stress Tests
+# ============================================================
+
+@test("Stability in the Dark - Capability Density gate")
+def test_stability_density_gate():
+    from deep_thought.stability.srp import SelfRegressionPrevention
+    from deep_thought.config import SRPConfig
+
+    config = SRPConfig(use_srp=True)
+    srp = SelfRegressionPrevention(config)
+
+    # Normal: small density change should be approved
+    approved, reason = srp.check_discovery_impact(1.0, 0.95)
+    assert approved, f"Small change should be approved, got: {reason}"
+
+    # Large drop should trigger rollback
+    approved, reason = srp.check_discovery_impact(1.0, 0.8)
+    assert not approved, f"Large drop should be rejected, got: {reason}"
+    assert srp.is_density_gate_active(), "Density gate should be active after rollback"
+
+    # Gate should remain active during cooldown
+    for _ in range(100):
+        srp.tick_density_gate()
+    assert srp.is_density_gate_active(), "Gate should still be active during cooldown"
+
+    # Gate should clear after full cooldown
+    for _ in range(500):
+        srp.tick_density_gate()
+    assert not srp.is_density_gate_active(), "Gate should clear after cooldown"
+    print(f"  Density gate working correctly")
+
+
+@test("Stability in the Dark - Dissection Layer checkpoint and rollback")
+def test_stability_dissection_rollback():
+    from deep_thought.stability.srp import SelfRegressionPrevention
+    from deep_thought.config import SRPConfig
+
+    config = SRPConfig(use_srp=True)
+    srp = SelfRegressionPrevention(config)
+
+    # Save a checkpoint
+    dissection_state = {"weights": [1.0, 2.0, 3.0], "bias": [0.1]}
+    srp.checkpoint_dissection_layer(dissection_state, step=100)
+
+    # Modify the state (simulating a bad discovery)
+    dissection_state["weights"][0] = 999.0
+
+    # Roll back
+    restored = srp.rollback_dissection_layer()
+    assert restored is not None, "Should have a checkpoint to restore"
+    assert restored["weights"][0] == 1.0, f"Should restore original weights, got {restored['weights'][0]}"
+    print(f"  Dissection layer rollback working correctly")
+
+
+@test("Stability in the Dark - Scientific method enforcement")
+def test_stability_scientific_method():
+    from deep_thought.stability.srp import SelfRegressionPrevention
+    from deep_thought.config import SRPConfig
+
+    config = SRPConfig(use_srp=True)
+    srp = SelfRegressionPrevention(config)
+
+    # Register a pending discovery
+    srp.register_pending_discovery({
+        "id": "disc_001",
+        "mechanic_tag_id": "Mechanic_001",
+        "prediction_accuracy_before": 0.80,
+        "prediction_accuracy_after": 0.85,  # 6.25% improvement
+    })
+
+    # Evaluate: should be proven (improvement > 5%)
+    proven = srp.evaluate_discovery_proof("disc_001")
+    assert proven, "Discovery with >5% improvement should be proven"
+
+    # Register another that doesn't improve enough
+    srp.register_pending_discovery({
+        "id": "disc_002",
+        "mechanic_tag_id": "Mechanic_002",
+        "prediction_accuracy_before": 0.80,
+        "prediction_accuracy_after": 0.82,  # Only 2.5% improvement
+    })
+
+    proven2 = srp.evaluate_discovery_proof("disc_002")
+    assert not proven2, "Discovery with <5% improvement should NOT be proven"
+
+    proven_discoveries = srp.get_proven_discoveries()
+    assert len(proven_discoveries) == 1
+    print(f"  Scientific method enforcement working: {len(proven_discoveries)} proven")
+
+
+@test("Full Agent - Construction with Black Box components")
+def test_agent_black_box():
+    from deep_thought.agent import DeepThoughtAgent
+    from deep_thought.config import DeepThoughtConfig
+
+    config = DeepThoughtConfig()
+    config.observation_dim = 4
+    config.action_dim = 2
+    config.num_actions = 2
+    config.action_space = "discrete"
+    config.encoder.latent_dim = 64
+    config.encoder.hidden_dim = 128
+    config.router.num_experts = 8
+    config.router.active_experts = 2
+    config.expert.hidden_dim = 64
+    config.memory.working_memory_size = 64
+    config.memory.episodic_key_dim = 16
+    config.memory.episodic_value_dim = 64
+    config.memory.semantic_dim = 16
+    config.curiosity.state_embedding_dim = 16
+    config.hierarchical.reflex_experts = 4
+    config.hierarchical.tactical_experts = 2
+    config.hierarchical.strategic_experts = 2
+    config.hierarchical.meta_experts = 2
+    config.hierarchical.reflex_hidden_dim = 32
+    config.hierarchical.tactical_hidden_dim = 32
+    config.hierarchical.strategic_hidden_dim = 32
+    config.hierarchical.meta_hidden_dim = 32
+    config.compute_economy.bidding_hidden_dim = 16
+    config.attention_maps.num_heads = 4
+    config.attention_maps.evolution_hidden_dim = 32
+    config.subgoal.goal_embedding_dim = 16
+    config.opponent_modeling.opponent_latent_dim = 16
+    config.opponent_modeling.tendency_dim = 8
+    # Black Box configs
+    config.mechanic_discovery.observation_dim = 64
+    config.mechanic_discovery.action_dim = 2
+    config.mechanic_discovery.context_dim = 16
+
+    agent = DeepThoughtAgent(config)
+    n_params = sum(p.numel() for p in agent.parameters())
+    print(f"  Agent parameters (with Black Box): {n_params:,}")
+    assert hasattr(agent, 'mde')
+    assert hasattr(agent, 'autonomous_specialization')
+    assert hasattr(agent, 'stability_in_the_dark_config')
+
+
+# ============================================================
 # Run All Tests
 # ============================================================
 
@@ -1253,6 +1563,16 @@ if __name__ == "__main__":
         test_governance_signal_normalizer,
         test_governance_integrated,
         test_agent_with_governance,
+        # Black Box component tests
+        test_mde_invariant_detection,
+        test_mde_routing_hints,
+        test_mde_contradiction,
+        test_autonomous_specialization_growth,
+        test_autonomous_specialization_contradiction,
+        test_stability_density_gate,
+        test_stability_dissection_rollback,
+        test_stability_scientific_method,
+        test_agent_black_box,
     ]
 
     for fn in test_fns:

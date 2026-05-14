@@ -10,6 +10,8 @@ Prevents performance collapse through multi-layer safeguards:
 - Routing collapse detection
 - Memory contamination control
 - Fast-weight drift control
+- Stability in the Dark: Capability Density binary gate with rollback
+- Stability in the Dark: Dissection Layer checkpoint & rollback
 """
 
 import torch
@@ -61,6 +63,27 @@ class SelfRegressionPrevention(nn.Module):
         self._expert_count_history = []
         self._neuron_explosion_detected = False
         self._expert_count_growth_threshold = 1.5  # Flag if count grows >50% without reward improvement
+
+        # ----------------------------------------------------------------
+        # Stability in the Dark: Capability Density binary gate
+        # ----------------------------------------------------------------
+        # When a discovery leads to a Capability Density drop, the SRP
+        # acts as a strict binary gate, rolling back the Dissection
+        # Layer weights to the last stable state.
+        self._density_before_last_discovery: float = 0.0
+        self._density_rollback_active: bool = False
+        self._steps_since_rollback: int = 0
+        self._rollback_cooldown: int = 500  # Steps to wait after rollback
+        self._density_rollback_gate: float = 0.1  # Fraction drop triggers rollback
+        # Checkpoints of the Dissection Layer state for rollback
+        self._dissection_checkpoints: List[Dict] = []
+        self._last_stable_dissection_state: Optional[Dict] = None
+        self._dissection_checkpoint_interval: int = 1000
+
+        # Scientific method: track whether discoveries have been proven
+        self._pending_discoveries: List[Dict] = []  # Unproven discoveries
+        self._proven_discoveries: List[Dict] = []  # Proven discoveries
+        self._scientific_method_proof_threshold: float = 0.05
     
     def update(
         self,
@@ -341,6 +364,142 @@ class SelfRegressionPrevention(nn.Module):
             if usefulness < threshold
         ]
     
+    # ----------------------------------------------------------------
+    # Stability in the Dark: Capability Density Gate
+    # ----------------------------------------------------------------
+
+    def check_discovery_impact(
+        self,
+        capability_density_before: float,
+        capability_density_after: float,
+    ) -> Tuple[bool, str]:
+        """Check whether a discovery caused a Capability Density regression.
+
+        The SRP acts as a strict binary gate: if a discovery leads to a
+        Capability Density drop exceeding the rollback gate threshold, the
+        discovery is rejected and the system rolls back.
+
+        Args:
+            capability_density_before: Density before the discovery.
+            capability_density_after: Density after the discovery.
+
+        Returns:
+            (approved, reason) tuple.  approved=False means rollback needed.
+        """
+        if capability_density_before < 1e-8:
+            return True, "no_baseline"
+
+        relative_drop = (
+            capability_density_before - capability_density_after
+        ) / capability_density_before
+
+        if relative_drop > self._density_rollback_gate:
+            self._density_rollback_active = True
+            self._steps_since_rollback = 0
+            self._density_before_last_discovery = capability_density_before
+            return False, f"density_drop({relative_drop:.4f} > {self._density_rollback_gate})"
+
+        return True, "density_stable"
+
+    def is_density_gate_active(self) -> bool:
+        """Whether the density gate is currently blocking changes."""
+        return self._density_rollback_active
+
+    def tick_density_gate(self):
+        """Advance the density gate cooldown.
+
+        After a rollback, the gate stays active for
+        ``_rollback_cooldown`` steps before allowing new discoveries.
+        """
+        if self._density_rollback_active:
+            self._steps_since_rollback += 1
+            if self._steps_since_rollback >= self._rollback_cooldown:
+                self._density_rollback_active = False
+                self._steps_since_rollback = 0
+
+    def checkpoint_dissection_layer(self, dissection_state: Dict, step: int):
+        """Save a checkpoint of the Dissection Layer state.
+
+        This allows the SRP to roll back the Dissection Layer if a
+        discovery causes a Capability Density drop.
+
+        Args:
+            dissection_state: State dict of the Dissection Layer.
+            step: Current step.
+        """
+        checkpoint = {
+            "state": deepcopy(dissection_state),
+            "step": step,
+            "capability_density": self._density_before_last_discovery,
+        }
+        self._dissection_checkpoints.append(checkpoint)
+        # Keep only last 5 checkpoints
+        if len(self._dissection_checkpoints) > 5:
+            self._dissection_checkpoints = self._dissection_checkpoints[-5:]
+        # Track last stable state
+        self._last_stable_dissection_state = checkpoint
+
+    def rollback_dissection_layer(self) -> Optional[Dict]:
+        """Roll back the Dissection Layer to the last stable state.
+
+        Returns:
+            State dict to restore, or None if no checkpoint available.
+        """
+        if self._last_stable_dissection_state is None:
+            return None
+        return deepcopy(self._last_stable_dissection_state["state"])
+
+    # ----------------------------------------------------------------
+    # Stability in the Dark: Scientific Method Enforcement
+    # ----------------------------------------------------------------
+
+    def register_pending_discovery(self, discovery: Dict):
+        """Register a new discovery that has not yet been proven.
+
+        The FVE requires the Dissection Layer to prove that a new
+        internal rule actually improves prediction accuracy before it
+        can influence the Sparse Cognitive Graph.
+
+        Args:
+            discovery: Dict with keys: 'id', 'mechanic_tag_id',
+                'prediction_accuracy_before', 'prediction_accuracy_after'.
+        """
+        self._pending_discoveries.append(discovery)
+
+    def evaluate_discovery_proof(self, discovery_id: str) -> bool:
+        """Evaluate whether a pending discovery has been proven.
+
+        A discovery is proven if it improves prediction accuracy by at
+        least ``_scientific_method_proof_threshold``.
+
+        Args:
+            discovery_id: ID of the discovery to evaluate.
+
+        Returns:
+            True if the discovery is proven and can influence the graph.
+        """
+        for disc in self._pending_discoveries:
+            if disc.get("id") == discovery_id:
+                acc_before = disc.get("prediction_accuracy_before", 0.0)
+                acc_after = disc.get("prediction_accuracy_after", 0.0)
+                if acc_before < 1e-8:
+                    improvement = acc_after
+                else:
+                    improvement = (acc_after - acc_before) / acc_before
+
+                if improvement >= self._scientific_method_proof_threshold:
+                    self._pending_discoveries.remove(disc)
+                    self._proven_discoveries.append(disc)
+                    return True
+                else:
+                    # Not proven yet — keep in pending
+                    return False
+        return False
+
+    def get_proven_discoveries(self) -> List[Dict]:
+        """Get all proven discoveries that can influence the graph."""
+        return self._proven_discoveries
+
     def get_stats(self) -> Dict:
         """Get SRP statistics."""
         return {
@@ -355,6 +514,10 @@ class SelfRegressionPrevention(nn.Module):
             },
             "num_unhealthy_experts": len(self.isolate_unhealthy_experts()),
             "neuron_explosion_detected": self._neuron_explosion_detected,
+            "density_gate_active": self._density_rollback_active,
+            "pending_discoveries": len(self._pending_discoveries),
+            "proven_discoveries": len(self._proven_discoveries),
+            "dissection_checkpoints": len(self._dissection_checkpoints),
         }
     
     def reset(self):

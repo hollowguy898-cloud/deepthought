@@ -428,6 +428,105 @@ class ShadowEvolutionConfig:
 
 
 @dataclass
+class MechanicDiscoveryConfig:
+    """Mechanic Discovery Engine (MDE) configuration.
+
+    Controls the system that discovers invariants (stable action-observation
+    relationships) across different contexts and generates self-labels that
+    guide the Sparse Router.
+
+    Attributes:
+        use_mde: Whether to enable the Mechanic Discovery Engine.
+        observation_dim: Dimensionality of observation embeddings.
+        action_dim: Dimensionality of the action space.
+        context_dim: Dimensionality of context embeddings.
+        stability_threshold: Stability score above which a candidate
+            is flagged as a Universal Mechanic.
+        min_context_span: Minimum distinct contexts before promotion.
+        window_size: Sliding window for invariant detection.
+        validation_interval: Steps between mechanic re-validations.
+        contradiction_threshold: Validation score below which a mechanic
+            is considered noise.
+        max_mechanics: Maximum tracked mechanics before eviction.
+        tag_prefix: Prefix for generated tag IDs.
+        routing_hint_strength: How strongly mechanic tags influence routing.
+        expert_affinity_decay: EMA decay for expert-mechanic affinity.
+    """
+    use_mde: bool = True
+    observation_dim: int = 64
+    action_dim: int = 4
+    context_dim: int = 32
+    stability_threshold: float = 0.85
+    min_context_span: int = 3
+    window_size: int = 200
+    validation_interval: int = 100
+    contradiction_threshold: float = 0.3
+    max_mechanics: int = 100
+    tag_prefix: str = "Mechanic"
+    routing_hint_strength: float = 0.1
+    expert_affinity_decay: float = 0.99
+
+
+@dataclass
+class AutonomousSpecializationConfig:
+    """Autonomous Expert Specialization configuration.
+
+    Controls how the Dissection Layer (MDE) triggers targeted expert
+    growth and contradiction-based pruning.
+
+    Attributes:
+        use_autonomous_specialization: Whether to enable autonomous
+            expert specialization.
+        growth_confidence_threshold: Minimum MDE invariant confidence
+            required to trigger targeted expert growth.
+        growth_context_span_min: Minimum context span for a mechanic
+            before it can trigger growth.
+        contradiction_prune_threshold: When a mechanic's validation
+            score drops below this, the associated expert is pruned.
+        specialization_noise_scale: Noise scale for initializing
+            specialist experts from parent clones.
+        max_specialists_per_mechanic: Maximum number of specialist
+            experts that can be created for a single mechanic.
+    """
+    use_autonomous_specialization: bool = True
+    growth_confidence_threshold: float = 0.8
+    growth_context_span_min: int = 3
+    contradiction_prune_threshold: float = 0.2
+    specialization_noise_scale: float = 0.005
+    max_specialists_per_mechanic: int = 3
+
+
+@dataclass
+class StabilityInTheDarkConfig:
+    """Stability in the Dark configuration.
+
+    Controls the SRP binary gate and FVE scientific method enforcement
+    for maintaining stability when the human operator cannot directly
+    observe the internal mechanics.
+
+    Attributes:
+        use_stability_in_the_dark: Whether to enable the enhanced
+            stability guardrails.
+        density_rollback_gate: If a discovery leads to a capability
+            density drop exceeding this fraction, the SRP rolls back
+            the Dissection Layer weights to the last stable state.
+        scientific_method_proof_threshold: The FVE requires the
+            Dissection Layer to prove that a new internal rule
+            improves prediction accuracy by at least this fraction
+            before it can influence the Sparse Cognitive Graph.
+        rollback_cooldown: Steps to wait after a rollback before
+            allowing new discoveries to influence architecture.
+        dissection_checkpoint_interval: Steps between checkpoints
+            of the Dissection Layer state for rollback.
+    """
+    use_stability_in_the_dark: bool = True
+    density_rollback_gate: float = 0.1
+    scientific_method_proof_threshold: float = 0.05
+    rollback_cooldown: int = 500
+    dissection_checkpoint_interval: int = 1000
+
+
+@dataclass
 class DynamicHyperparamsConfig:
     """Dynamic Hyperparameter Adaptation configuration.
 
@@ -622,7 +721,12 @@ class DeepThoughtConfig:
     formal_verification: FormalVerificationConfig = field(default_factory=FormalVerificationConfig)
     shadow_evolution: ShadowEvolutionConfig = field(default_factory=ShadowEvolutionConfig)
     dynamic_hyperparams: DynamicHyperparamsConfig = field(default_factory=DynamicHyperparamsConfig)
-    
+
+    # Black Box components
+    mechanic_discovery: MechanicDiscoveryConfig = field(default_factory=MechanicDiscoveryConfig)
+    autonomous_specialization: AutonomousSpecializationConfig = field(default_factory=AutonomousSpecializationConfig)
+    stability_in_the_dark: StabilityInTheDarkConfig = field(default_factory=StabilityInTheDarkConfig)
+
     # Training
     training: TrainingConfig = field(default_factory=TrainingConfig)
     
@@ -676,6 +780,9 @@ class DeepThoughtConfig:
             "formal_verification": FormalVerificationConfig,
             "shadow_evolution": ShadowEvolutionConfig,
             "dynamic_hyperparams": DynamicHyperparamsConfig,
+            "mechanic_discovery": MechanicDiscoveryConfig,
+            "autonomous_specialization": AutonomousSpecializationConfig,
+            "stability_in_the_dark": StabilityInTheDarkConfig,
         }
         
         config = cls()
