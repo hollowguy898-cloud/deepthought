@@ -5,8 +5,7 @@ PPO trainer for Deep Thought.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple, List
-from collections import deque
+from typing import Dict, Optional, Tuple
 
 from deep_thought.config import TrainingConfig
 
@@ -25,7 +24,10 @@ class RolloutBuffer:
         self.log_probs = []
         self.values = []
         self.latents = []
+        self.next_latents = []
         self.memory_reads = []
+        self.selected_indices = []
+        self.gates = []
     
     def add(
         self,
@@ -36,21 +38,27 @@ class RolloutBuffer:
         log_prob,
         value,
         latent,
-        memory_read
+        next_latent,
+        memory_read,
+        selected_indices,
+        gates
     ):
         """Add a timestep to buffer."""
-        self.observations.append(observation)
-        self.actions.append(action)
+        self.observations.append(observation.detach())
+        self.actions.append(action.detach())
         self.rewards.append(float(reward))
         self.dones.append(float(done))
-        self.log_probs.append(log_prob)
+        self.log_probs.append(log_prob.detach())
         # Store value as scalar for consistent advantage computation
         if isinstance(value, torch.Tensor):
             self.values.append(value.item())
         else:
             self.values.append(float(value))
-        self.latents.append(latent)
-        self.memory_reads.append(memory_read)
+        self.latents.append(latent.detach())
+        self.next_latents.append(next_latent.detach())
+        self.memory_reads.append(memory_read.detach())
+        self.selected_indices.append(selected_indices.detach())
+        self.gates.append(gates.detach())
     
     def clear(self):
         """Clear buffer."""
@@ -61,14 +69,20 @@ class RolloutBuffer:
         self.log_probs = []
         self.values = []
         self.latents = []
+        self.next_latents = []
         self.memory_reads = []
+        self.selected_indices = []
+        self.gates = []
     
     def get_batch(self) -> Dict:
         """Get batch as dictionary."""
         obs = torch.stack(self.observations)
         actions = torch.stack(self.actions)
         latents = torch.stack(self.latents)
+        next_latents = torch.stack(self.next_latents)
         memory_reads = torch.stack(self.memory_reads)
+        selected_indices = torch.stack(self.selected_indices)
+        gates = torch.stack(self.gates)
 
         # Squeeze out extra dimensions from single-step unsqueeze(0) during rollout
         # obs: (T, 1, ...) -> (T, ...), actions: (T, 1) -> (T,)
@@ -78,18 +92,31 @@ class RolloutBuffer:
             actions = actions.squeeze(-1)
         if latents.dim() == 3 and latents.size(1) == 1:
             latents = latents.squeeze(1)
+        if next_latents.dim() == 3 and next_latents.size(1) == 1:
+            next_latents = next_latents.squeeze(1)
         if memory_reads.dim() == 3 and memory_reads.size(1) == 1:
             memory_reads = memory_reads.squeeze(1)
+        if selected_indices.dim() == 3 and selected_indices.size(1) == 1:
+            selected_indices = selected_indices.squeeze(1)
+        if gates.dim() == 3 and gates.size(1) == 1:
+            gates = gates.squeeze(1)
+
+        log_probs = torch.stack(self.log_probs)
+        if log_probs.dim() == 2 and log_probs.size(-1) == 1:
+            log_probs = log_probs.squeeze(-1)
 
         return {
             "observations": obs,
             "actions": actions,
             "rewards": torch.tensor(self.rewards, dtype=torch.float32),
             "dones": torch.tensor(self.dones, dtype=torch.float32),
-            "log_probs": torch.stack(self.log_probs),
+            "log_probs": log_probs,
             "values": torch.tensor(self.values, dtype=torch.float32),
             "latents": latents,
+            "next_latents": next_latents,
             "memory_reads": memory_reads,
+            "selected_indices": selected_indices,
+            "gates": gates,
         }
     
     def __len__(self):
@@ -128,6 +155,31 @@ class PPOTrainer:
         self.ppo_epochs = config.ppo_epochs
         self.target_kl = config.target_kl
         self.max_grad_norm = config.max_grad_norm
+        self._last_action: Optional[torch.Tensor] = None
+        self._last_reward: Optional[float] = None
+        self._last_done: Optional[bool] = None
+
+    def _to_env_action(self, action: torch.Tensor, env):
+        """Convert a sampled tensor action into an environment action."""
+        action_np = action.detach().cpu().numpy()
+        if self.action_space == "discrete":
+            return int(action_np.item() if action_np.ndim == 0 else action_np[0])
+
+        action_np = action_np[0] if action_np.ndim > 1 else action_np
+        if hasattr(env.action_space, "low") and hasattr(env.action_space, "high"):
+            import numpy as np
+            action_np = np.clip(action_np, env.action_space.low, env.action_space.high)
+        return action_np
+
+    def _world_model_actions(self, actions: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Convert stored actions into world-model action vectors."""
+        if self.action_space == "discrete":
+            action_indices = actions.long()
+            if action_indices.dim() > 1:
+                action_indices = action_indices.squeeze(-1)
+            action_input = torch.zeros(action_indices.size(0), self.action_dim, device=device)
+            return action_input.scatter_(1, action_indices.unsqueeze(1), 1.0)
+        return actions.to(device).float()
     
     def collect_rollout(
         self,
@@ -153,19 +205,29 @@ class PPOTrainer:
             episode_done: Whether the episode ended
             last_observation: The last observation (after the last env.step)
         """
+        current_h = getattr(self.model, "h_t", None)
+        if current_h is not None and observation.size(0) != current_h.size(0):
+            self.model.reset(observation.size(0))
+
         total_reward = 0.0
         steps = 0
         episode_done = False
         
-        for _ in range(self.config.rollout_length):
-            # Get action from model
+        rollout_length = min(self.config.rollout_length, self.buffer.capacity)
+        for _ in range(rollout_length):
+            # Get action from the full agent path so rollout policy matches
+            # the policy optimized by PPO and all submodules receive traffic.
             with torch.no_grad():
-                latent, encoder_info = self.model.encoder(observation)
-                
-                # Get policy and value
-                policy_output = self.model.policy_head(latent)
-                value_output = self.model.critic_head(latent)
-                
+                outputs = self.model(
+                    observation,
+                    action=self._last_action,
+                    reward=self._last_reward,
+                    done=self._last_done,
+                    training=True,
+                )
+                policy_output = torch.nan_to_num(outputs["policy_logits"])
+                value_output = torch.nan_to_num(outputs["value"])
+
                 if self.action_space == "discrete":
                     action_probs = F.softmax(policy_output, dim=-1)
                     dist = torch.distributions.Categorical(action_probs)
@@ -184,14 +246,17 @@ class PPOTrainer:
                 value = value_output.squeeze(-1)
             
             # Step environment
-            action_np = action.cpu().numpy()
-            if action_np.ndim == 0:
-                action_np = action_np.item()
-            else:
-                action_np = action_np[0]
-            
+            action_np = self._to_env_action(action, env)
             next_observation, reward, done, truncated, info = env.step(action_np)
             done = done or truncated
+            next_observation_tensor = torch.tensor(
+                next_observation,
+                dtype=torch.float32,
+                device=device
+            ).unsqueeze(0)
+
+            with torch.no_grad():
+                next_latent, _ = self.model.encoder(next_observation_tensor)
             
             # Store in buffer
             self.buffer.add(
@@ -201,18 +266,34 @@ class PPOTrainer:
                 done,
                 log_prob,
                 value,
-                latent,
-                m_t
+                outputs.get("latent"),
+                next_latent,
+                outputs.get("memory_info", {}).get(
+                    "memory_read",
+                    torch.zeros_like(outputs["latent"])
+                ),
+                outputs.get(
+                    "selected_indices",
+                    torch.zeros(action.size(0), 1, dtype=torch.long, device=device)
+                ),
+                outputs.get(
+                    "gates",
+                    torch.ones(action.size(0), 1, device=device)
+                )
             )
             
             total_reward += reward
             steps += 1
-            
-            # Move next observation to device
-            observation = torch.tensor(next_observation, dtype=torch.float32, device=device).unsqueeze(0)
+            self._last_action = action.detach()
+            self._last_reward = float(reward)
+            self._last_done = bool(done)
+            observation = next_observation_tensor
             
             if done:
                 episode_done = True
+                self._last_action = None
+                self._last_reward = None
+                self._last_done = None
                 break
         
         return total_reward, steps, episode_done, observation
@@ -302,7 +383,7 @@ class PPOTrainer:
             num_updates = 0
             
             # Mini-batch updates
-            mini_batch_size = min(64, len(indices))
+            mini_batch_size = min(self.config.batch_size, len(indices))
             for start in range(0, len(indices), mini_batch_size):
                 end = start + mini_batch_size
                 mb_indices = indices[start:end]
@@ -314,6 +395,7 @@ class PPOTrainer:
                 mb_advantages = advantages[mb_indices]
                 mb_returns = returns[mb_indices]
                 mb_latents = batch["latents"][mb_indices]
+                mb_next_latents = batch["next_latents"][mb_indices]
                 
                 # Forward pass through FULL agent pipeline for gradient flow.
                 # We use a stateless forward pass that goes through encoder →
@@ -398,6 +480,44 @@ class PPOTrainer:
                     self.entropy_coef,
                     entropy_mean=entropy_mean
                 )
+
+                aux_loss = torch.tensor(0.0, device=mb_device)
+                if getattr(self.model.config.world_model, "use_world_model", True):
+                    wm_actions = self._world_model_actions(mb_actions, mb_device)
+                    z_pred, reward_pred, done_pred = self.model.world_model(
+                        mb_latents.detach(),
+                        wm_actions.detach()
+                    )
+                    from deep_thought.optimization.losses import compute_world_model_loss
+                    wm_losses = compute_world_model_loss(
+                        z_pred,
+                        mb_next_latents.detach(),
+                        reward_pred,
+                        batch["rewards"][mb_indices].to(mb_device),
+                        done_pred,
+                        batch["dones"][mb_indices].to(mb_device),
+                        None,
+                        None,
+                        state_coef=self.config.world_model_loss_coef,
+                    )
+                    aux_loss = aux_loss + wm_losses["total_loss"]
+                    total_world_model_loss = wm_losses["total_loss"].item()
+                else:
+                    total_world_model_loss = 0.0
+
+                if "entropy" in router_info:
+                    router_losses = self.model.router.compute_losses(router_info)
+                    for router_loss in router_losses.values():
+                        aux_loss = aux_loss + router_loss
+
+                from deep_thought.optimization.losses import compute_compute_penalty
+                aux_loss = aux_loss + compute_compute_penalty(
+                    compute_costs,
+                    gates,
+                    selected_indices,
+                    self.config.compute_penalty_coef,
+                )
+                loss_dict["total_loss"] = loss_dict["total_loss"] + aux_loss
                 
                 # Compute KL divergence
                 kl = (mb_old_log_probs - new_log_probs).mean()
@@ -427,6 +547,7 @@ class PPOTrainer:
                 metrics[f"epoch_{epoch}_value_loss"] = total_value_loss / num_updates
                 metrics[f"epoch_{epoch}_entropy"] = total_entropy / num_updates
                 metrics[f"epoch_{epoch}_kl"] = total_kl / num_updates
+                metrics[f"epoch_{epoch}_world_model_loss"] = total_world_model_loss
         
         # Add aggregate metrics for easy access
         if any("policy_loss" in k for k in metrics):
@@ -436,6 +557,29 @@ class PPOTrainer:
             value_losses = [v for k, v in metrics.items() if "value_loss" in k]
             metrics["value_loss"] = sum(value_losses) / len(value_losses)
         metrics["total_loss"] = metrics.get("policy_loss", 0.0) + metrics.get("value_loss", 0.0)
+
+        if hasattr(self.model, "update_expert_utility"):
+            reward_contributions: Dict[int, float] = {}
+            selected = batch["selected_indices"]
+            gates = batch["gates"]
+            rewards = batch["rewards"].to(gates.device)
+            for timestep in range(selected.size(0)):
+                for slot in range(selected.size(1)):
+                    exp_id = int(selected[timestep, slot].item())
+                    contribution = float((rewards[timestep] * gates[timestep, slot]).item())
+                    reward_contributions[exp_id] = reward_contributions.get(exp_id, 0.0) + contribution
+
+            gradient_norms: Dict[int, float] = {}
+            for exp_id in self.model.expert_bank.expert_stats:
+                expert = self.model.expert_bank._get_expert(exp_id)
+                if expert is None:
+                    continue
+                norm = 0.0
+                for param in expert.parameters():
+                    if param.grad is not None:
+                        norm += float(param.grad.detach().norm().item())
+                gradient_norms[exp_id] = norm
+            self.model.update_expert_utility(gradient_norms, reward_contributions)
         
         # Clear buffer
         self.buffer.clear()
