@@ -894,10 +894,9 @@ class OpponentModelingSystem(nn.Module):
             # Current encoded observation for this opponent
             current_encoded = encoded[:, opp_idx, :]  # (batch, latent)
 
-            # Use stored GRU hidden state if available (for the first batch
-            # element; multi-batch GRU state management would require more
-            # complex indexing — we use the first batch element's state)
-            hidden = self.gru_hidden_states[:, opp_idx, :].unsqueeze(1)  # (layers, 1, hidden)
+            # Use stored GRU hidden state, expanded to full batch dimension
+            # so every batch element gets the correct hidden state
+            hidden = self.gru_hidden_states[:, opp_idx, :].unsqueeze(1).expand(-1, batch_size, -1).contiguous()  # (layers, batch_size, hidden)
 
             # If we have interaction history, encode it first
             if opp_history is not None and opp_history.dim() == 2:

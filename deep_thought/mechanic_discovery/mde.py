@@ -427,7 +427,7 @@ class InvariantDetector:
 
     def _group_by_action(
         self,
-    ) -> Dict[torch.Tensor, List[_StepRecord]]:
+    ) -> Dict[tuple, List[_StepRecord]]:
         """Group step records by action similarity.
 
         Uses greedy clustering: iterate through records and assign each
@@ -436,25 +436,31 @@ class InvariantDetector:
         match is found, start a new group.
 
         Returns:
-            Mapping from representative action tensor to list of records.
+            Mapping from representative action key (tuple of floats) to
+            list of records.  Tuple keys are used instead of tensors to
+            ensure value-based equality for dict lookups.
         """
-        groups: Dict[torch.Tensor, List[_StepRecord]] = {}
+        groups: Dict[tuple, List[_StepRecord]] = {}
+        # Store the actual tensor alongside the key for similarity computation
+        repr_tensors: Dict[tuple, torch.Tensor] = {}
 
         for record in self._window:
             assigned = False
-            for repr_action in groups:
+            for action_key, repr_tensor in repr_tensors.items():
                 sim = F.cosine_similarity(
-                    repr_action.unsqueeze(0),
+                    repr_tensor.unsqueeze(0),
                     record.action.unsqueeze(0),
                     dim=-1,
                 ).item()
                 if sim > self._ACTION_SIMILARITY_THRESHOLD:
-                    groups[repr_action].append(record)
+                    groups[action_key].append(record)
                     assigned = True
                     break
 
             if not assigned:
-                groups[record.action] = [record]
+                action_key = tuple(record.action.detach().cpu().tolist())
+                groups[action_key] = [record]
+                repr_tensors[action_key] = record.action
 
         return groups
 

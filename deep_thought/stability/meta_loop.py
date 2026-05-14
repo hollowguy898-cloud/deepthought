@@ -304,10 +304,15 @@ class MetaLoopController(nn.Module):
         self.config = config
         self.tracker = CapabilityDensityTracker(config)
         self.action_net = MetaActionNetwork(config, state_dim=state_dim)
+        self.meta_optimizer = torch.optim.Adam(
+            self.action_net.parameters(), lr=config.meta_lr
+        )
         self._prev_density: float = 0.0
         self._frozen: bool = False
         self._last_action: int = MetaActionNetwork.NO_OP
         self._cumulative_meta_reward: float = 0.0
+        self._last_log_prob: Optional[torch.Tensor] = None
+        self._last_value: Optional[torch.Tensor] = None
         self._step: int = 0
 
     def observe(
@@ -372,8 +377,21 @@ class MetaLoopController(nn.Module):
             return MetaActionNetwork.NO_OP, 0.0, {"reason": "no_meta_state"}
 
         action_probs, value, info = self.action_net(meta_state)
-        action = torch.argmax(action_probs, dim=-1).item()
+
+        # Epsilon-greedy exploration: with probability epsilon, sample
+        # randomly from the action distribution instead of taking argmax.
+        epsilon = 0.1
+        if torch.rand(1).item() < epsilon:
+            action = torch.multinomial(action_probs, 1).squeeze(-1).item()
+            log_prob = torch.log(action_probs.squeeze(0)[action] + 1e-8)
+        else:
+            action = torch.argmax(action_probs, dim=-1).item()
+            log_prob = torch.log(action_probs.squeeze(0)[action] + 1e-8)
         self._last_action = action
+
+        # Store for REINFORCE gradient update in record_reward
+        self._last_log_prob = log_prob
+        self._last_value = value
 
         info["action_probs"] = action_probs.detach()
         info["chosen_action"] = action
@@ -381,13 +399,29 @@ class MetaLoopController(nn.Module):
         return action, value.item(), info
 
     def record_reward(self, new_density: float):
-        """Record the meta-reward after an action is taken.
+        """Record the meta-reward after an action is taken and perform a
+        gradient update step.
 
         R_meta = capability_density (directly).
         A positive meta-reward means the system is becoming more efficient.
         """
         meta_reward = new_density
         self._cumulative_meta_reward += meta_reward
+
+        # Perform meta-gradient update using REINFORCE with baseline
+        if self._last_log_prob is not None and self._last_value is not None:
+            advantage = meta_reward - self._last_value.detach().item()
+            policy_loss = -self._last_log_prob * advantage
+            value_loss = F.mse_loss(self._last_value, torch.tensor([meta_reward]))
+            total_loss = policy_loss + 0.5 * value_loss
+
+            self.meta_optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.action_net.parameters(), 1.0)
+            self.meta_optimizer.step()
+
+            self._last_log_prob = None
+            self._last_value = None
 
     def should_freeze_architecture(self) -> bool:
         """Whether architectural changes should be frozen."""
@@ -422,5 +456,7 @@ class MetaLoopController(nn.Module):
         self._frozen = False
         self._last_action = MetaActionNetwork.NO_OP
         self._cumulative_meta_reward = 0.0
+        self._last_log_prob = None
+        self._last_value = None
         self._step = 0
         self.tracker = CapabilityDensityTracker(self.config)

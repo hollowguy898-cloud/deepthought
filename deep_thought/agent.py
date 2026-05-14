@@ -196,6 +196,7 @@ class DeepThoughtAgent(nn.Module):
         if config.curiosity.use_curiosity:
             self.curiosity = IntrinsicMotivationSystem(config.curiosity)
             self.curiosity_proj = nn.Linear(config.encoder.latent_dim, config.curiosity.state_embedding_dim)
+            self.curiosity_error_proj = nn.Linear(config.encoder.latent_dim, config.curiosity.state_embedding_dim)
         else:
             self.curiosity = None
 
@@ -484,12 +485,7 @@ class DeepThoughtAgent(nn.Module):
             elementwise_pred_error = torch.zeros_like(x_t)
             prediction_error = torch.tensor(0.0, device=observation.device)
 
-        # Store current prediction for next step comparison
-        if action is not None and self.world_model is not None:
-            with torch.no_grad():
-                self._prev_z_pred = self.world_model(x_t, action_input)[0].detach()
-        else:
-            self._prev_z_pred = None
+        # (World model prediction moved to single call below to avoid duplicate computation)
 
         # --- Attention Probability Maps ---
         # Weight the latent by attention before routing
@@ -509,7 +505,7 @@ class DeepThoughtAgent(nn.Module):
             # Project x_t to curiosity embedding dim
             embedded_latent = self.curiosity_proj(x_t)  # (batch, state_embedding_dim)
             # Project elementwise prediction error to curiosity embedding dim
-            pred_error_proj = self.curiosity_proj(elementwise_pred_error)  # (batch, state_embedding_dim)
+            pred_error_proj = self.curiosity_error_proj(elementwise_pred_error)  # (batch, state_embedding_dim)
             intrinsic_reward, curiosity_info = self.curiosity(
                 latent=embedded_latent,
                 prediction_error=pred_error_proj,
@@ -565,7 +561,8 @@ class DeepThoughtAgent(nn.Module):
             # Build expert_utilities tensor (batch, num_experts)
             utility_tensor = torch.zeros(batch_size, num_experts, device=observation.device)
             for i, stats in self.expert_bank.expert_stats.items():
-                utility_tensor[:, i] = stats.utility_score
+                if i < num_experts:  # Only include experts that fit in the tensor
+                    utility_tensor[:, i] = stats.utility_score
 
             # Build routing_gates tensor (batch, num_experts) from sparse gates
             routing_gates_full = torch.zeros(batch_size, num_experts, device=observation.device)
@@ -599,7 +596,7 @@ class DeepThoughtAgent(nn.Module):
         # Apply compute allocations to expert outputs if compute market is enabled
         if self.compute_market is not None and compute_allocations is not None:
             # Weight delta_h by compute allocations for selected experts
-            selected_allocs = compute_allocations[selected_indices]  # (batch, active_experts)
+            selected_allocs = compute_allocations.gather(1, selected_indices)  # (batch, active_experts)
             alloc_scale = selected_allocs.mean(dim=-1, keepdim=True)  # (batch, 1)
             mean_alloc = compute_allocations.mean() + 1e-8
             alloc_scale = alloc_scale / mean_alloc
@@ -677,7 +674,8 @@ class DeepThoughtAgent(nn.Module):
         outputs["policy_logits"] = policy_logits
         outputs["value"] = value
 
-        # World model prediction
+        # World model prediction (single call with gradients for training,
+        # detached result stored for next-step prediction error comparison)
         if self.world_model is not None and action is not None:
             z_next, r_pred, d_pred = self.world_model(x_t, action_input)
             outputs["world_model"] = {
@@ -685,6 +683,10 @@ class DeepThoughtAgent(nn.Module):
                 "r_pred": r_pred,
                 "d_pred": d_pred,
             }
+            # Store for next-step prediction error comparison
+            self._prev_z_pred = z_next.detach()
+        else:
+            self._prev_z_pred = None
 
         # Feature extraction
         if self.feature_validator is not None and training:

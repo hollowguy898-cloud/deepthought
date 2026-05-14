@@ -609,6 +609,14 @@ class AttentionProbabilityMap(nn.Module):
         """
         batch_size = latent.size(0)
 
+        # Degenerate case: with a single token the self-attention dot
+        # product reduces to a scalar per head that always gets weight 1.0
+        # after softmax, making the whole attention block a no-op.  Return
+        # uniform attention so the content signal does not distort the
+        # combined map.
+        if batch_size == 1:
+            return torch.ones(1, self.latent_dim, device=latent.device) / self.latent_dim
+
         q = self.q_proj(latent)  # [B, D]
         k = self.k_proj(latent)  # [B, D]
         v = self.v_proj(latent)  # [B, D]

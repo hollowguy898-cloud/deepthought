@@ -166,6 +166,33 @@ def train(
         agent.consolidate_memory() # Governor checks if MEDIUM timescale allows
         agent.validate_features()  # Governor checks if SLOW timescale allows
 
+        # CRITICAL FIX: Rebuild optimizer when model structure changes
+        # Dynamically created parameters (adapters, reactivated experts,
+        # subgoal projections, expert compiler candidates) must be added
+        # to the optimizer for gradient updates to work.
+        structure_changed = False
+
+        # Check expert compiler for structure changes
+        if agent.expert_compiler is not None:
+            if agent.expert_compiler.consume_structure_change():
+                structure_changed = True
+
+        # Check expert bank for new experts (growth/reactivation)
+        current_param_ids = {id(p) for p in agent.parameters()}
+        if not hasattr(train, '_last_param_ids'):
+            train._last_param_ids = current_param_ids
+        if current_param_ids != train._last_param_ids:
+            structure_changed = True
+            train._last_param_ids = current_param_ids
+
+        if structure_changed:
+            # Add new parameters to optimizer while preserving existing state
+            old_param_ids = {id(p) for group in optimizer.param_groups for p in group['params']}
+            new_params = [p for p in agent.parameters() if id(p) not in old_param_ids]
+            if new_params:
+                optimizer.add_param_group({'params': new_params, 'lr': config.training.learning_rate})
+                logger.info(f"Added {len(new_params)} new parameters to optimizer after structural change")
+
         # Update SRP
         agent.update_srp(rollout_reward, metrics.get("total_loss", 0.0))
         

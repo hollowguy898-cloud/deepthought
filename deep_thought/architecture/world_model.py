@@ -179,7 +179,9 @@ class WorldModel(nn.Module):
             
             # Update
             z_t = z_next
-            done = done + d_pred if d_pred is not None else done
+            # Correct probabilistic accumulation: P(done by t) = 1 - (1 - P(done by t-1)) * (1 - P(done at t))
+            if d_pred is not None:
+                done = 1.0 - (1.0 - done) * (1.0 - d_pred)
             done = done.clamp(max=1.0)
         
         z_seq = torch.stack(z_seq, dim=1)  # [B, T+1, D]

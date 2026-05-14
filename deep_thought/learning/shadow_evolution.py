@@ -70,7 +70,7 @@ class ShadowEvolutionConfig:
     """
     use_shadow_evolution: bool = True
     max_shadow_experts: int = 16
-    mutation_rate: float = 0.1
+    mutation_rate: float = 0.03  # 3% per parameter per mutation application
     mutation_strength: float = 0.01
     tournament_size: int = 4
     validation_window: int = 100
@@ -178,8 +178,8 @@ class ShadowMutator:
                 applied.append(f"widening({key})")
 
             elif mtype == MutationType.ACTIVATION_SWAP:
-                # Flip sign of some weights (simulates activation change)
-                mask = torch.rand_like(tensor) > 0.5
+                # Flip sign of a small fraction of weights (simulates activation change)
+                mask = torch.rand_like(tensor) > 0.9  # Only 10% flip rate (was 50%)
                 mutated[key] = tensor * mask.float() - tensor * (~mask).float()
                 applied.append(f"activation_swap({key})")
 
@@ -305,6 +305,14 @@ class ShadowEvolutionEngine:
                 self._total_mutations += 1
 
             shadow.age += 1
+
+            # Evaluate shadow and propose swap if it outperforms parent
+            if self._can_propose_swap(shadow):
+                swap_proposals.append((shadow_id, shadow.parent_id))
+                self._total_swaps_proposed += 1
+                self._proposal_history[shadow.parent_id] = (
+                    self._proposal_history.get(shadow.parent_id, 0) + 1
+                )
 
         return swap_proposals
 

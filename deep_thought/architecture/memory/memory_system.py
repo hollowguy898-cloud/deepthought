@@ -113,23 +113,31 @@ class MemorySystem(nn.Module):
 
             # Fix 5: Filter reads by relevance — only use high-relevance entries
             # The read already returns top-k, but we apply an additional
-            # relevance filter to zero out low-relevance reads
+            # relevance filter to zero out low-relevance reads.
+            #
+            # KNOWN LIMITATION: Using vector norm as a proxy for relevance
+            # conflates magnitude with semantic meaning.  A memory entry
+            # with small norm but high cosine similarity to the query can
+            # be incorrectly filtered out, while a large-norm but
+            # irrelevant entry may pass.  Consider replacing this with
+            # cosine-similarity-based filtering for production use.
             read_norm = episodic_read.norm(dim=-1, keepdim=True)
             mean_norm = read_norm.mean() + 1e-8
             relevance = (read_norm / mean_norm).squeeze(-1)
-            # Apply threshold: zero out reads below threshold
-            read_mask = (relevance > self.read_filter_threshold).float().unsqueeze(-1)
+            # Soft gating: allows gradient flow while still filtering low-relevance entries
+            read_mask = torch.sigmoid((relevance - self.read_filter_threshold) * 10.0).unsqueeze(-1)
             episodic_read = episodic_read * read_mask
 
         if self.semantic is not None:
             semantic_read, semantic_concepts = self.semantic.read(x_t, k=3)
             memory_info["semantic_concepts"] = len(semantic_concepts)
 
-            # Fix 5: Same filtering for semantic reads
+            # Fix 5: Same soft gating for semantic reads
+            # (Same norm-based limitation as episodic filter above)
             read_norm = semantic_read.norm(dim=-1, keepdim=True)
             mean_norm = read_norm.mean() + 1e-8
             relevance = (read_norm / mean_norm).squeeze(-1)
-            read_mask = (relevance > self.read_filter_threshold).float().unsqueeze(-1)
+            read_mask = torch.sigmoid((relevance - self.read_filter_threshold) * 10.0).unsqueeze(-1)
             semantic_read = semantic_read * read_mask
 
         # Fuse memory reads

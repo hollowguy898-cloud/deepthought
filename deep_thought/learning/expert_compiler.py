@@ -59,6 +59,9 @@ class ExpertCompiler(nn.Module):
         
         # Anchor loss coefficient
         self.anchor_coef = config.anchor_loss_coef
+
+        # Track structural changes for optimizer cleanup
+        self._structure_changed = False
     
     def crystallize_feature(self, feature: Feature) -> torch.Tensor:
         """
@@ -247,6 +250,7 @@ class ExpertCompiler(nn.Module):
                 attr_name = f"candidate_{candidate_id}"
                 if hasattr(self, attr_name):
                     delattr(self, attr_name)
+                self._structure_changed = True
                 return expert
         
         return None
@@ -265,6 +269,8 @@ class ExpertCompiler(nn.Module):
             attr_name = f"candidate_{cid}"
             if hasattr(self, attr_name):
                 delattr(self, attr_name)
+        if to_remove:
+            self._structure_changed = True
     
     def split_expert(
         self,
@@ -323,6 +329,18 @@ class ExpertCompiler(nn.Module):
         
         return None
     
+    def consume_structure_change(self) -> bool:
+        """Check if structure has changed since last check, reset flag.
+
+        Returns True if modules were added or removed (e.g., via
+        promote_candidate or prune_candidates) since the last call,
+        indicating that the optimizer should be rebuilt to avoid
+        stale parameter references.
+        """
+        changed = self._structure_changed
+        self._structure_changed = False
+        return changed
+
     def get_candidate_stats(self) -> Dict:
         """Get statistics about candidates."""
         stats = {

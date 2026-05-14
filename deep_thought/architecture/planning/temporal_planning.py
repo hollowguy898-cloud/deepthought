@@ -53,13 +53,15 @@ class TemporalPlanningLayer(nn.Module):
         self.num_experts = num_experts
         self._latent_dim = latent_dim
         
+        # Register as buffer so it survives checkpoint save/load
+        self.register_buffer('_networks_initialized_flag', torch.tensor(False))
+
         # Planning network - will be lazily initialized if latent_dim not provided
         if latent_dim is not None:
             self._init_networks(latent_dim, action_dim)
         else:
             self.planner = None
             self.controller = None
-            self._networks_initialized = False
 
         # Goal compression network - fixed size
         self.goal_compressor = nn.Sequential(
@@ -98,11 +100,11 @@ class TemporalPlanningLayer(nn.Module):
             hidden_size=512
         )
         
-        self._networks_initialized = True
+        self._networks_initialized_flag.fill_(True)
     
     def _ensure_initialized(self, h_t: torch.Tensor):
         """Lazily initialize planner and controller once latent dim is known."""
-        if self._networks_initialized:
+        if self._networks_initialized_flag.item():
             return
         latent_dim = h_t.size(-1)
         self._init_networks(latent_dim, self._action_dim)
@@ -173,6 +175,8 @@ class TemporalPlanningLayer(nn.Module):
             step_logits = timeline[:, t, :]
             top_k_vals, top_k_idx = torch.topk(step_logits, actual_k, dim=-1)
             
+            # NOTE: Uses batch index 0 only (representative sample).
+            # TODO: Support per-batch-element scheduling.
             for i in range(actual_k):
                 expert_id = top_k_idx[0, i].item()
                 priority = top_k_vals[0, i].item()
@@ -216,8 +220,8 @@ class TemporalPlanningLayer(nn.Module):
             step_logits = timeline[:, t, :]
             top_k_vals, top_k_idx = torch.topk(step_logits, actual_k, dim=-1)
             
-            # Normalize gates
-            normalized_gates = top_k_vals / (top_k_vals.sum(dim=-1, keepdim=True) + 1e-8)
+            # Normalize gates using softmax (ensures non-negative, sums to 1)
+            normalized_gates = F.softmax(top_k_vals, dim=-1)
             
             gates.append(normalized_gates)
             indices.append(top_k_idx)
@@ -428,6 +432,22 @@ class TemporalPlanningLayer(nn.Module):
                 self.current_plan = None
                 self.plan_step = 0
     
+
+    def state_dict(self, *args, **kwargs):
+        """Custom state_dict that includes controller_state."""
+        d = super().state_dict(*args, **kwargs)
+        if self.controller_state is not None:
+            d["controller_state"] = self.controller_state
+        return d
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Custom load_state_dict that restores controller_state."""
+        controller_state = state_dict.pop("controller_state", None)
+        super().load_state_dict(state_dict, strict=strict)
+        if controller_state is not None:
+            self.controller_state = controller_state
+        return
+
     def reset_plan(self):
         """Reset current plan."""
         self.current_plan = None

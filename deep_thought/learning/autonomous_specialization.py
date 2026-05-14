@@ -177,6 +177,10 @@ class AutonomousSpecialization:
                 record.validation_score = 0.0
                 experts_to_prune.append(record.expert_id)
                 self._total_specialists_pruned += 1
+                # Decrement specialist count so growth is no longer blocked
+                self._specialist_count[mechanic_tag_id] = max(
+                    0, self._specialist_count.get(mechanic_tag_id, 0) - 1
+                )
 
         self._contradicted_mechanics.append(mechanic_tag_id)
         return experts_to_prune
@@ -209,6 +213,10 @@ class AutonomousSpecialization:
                 if validation_score < self.config.contradiction_prune_threshold:
                     record.is_active = False
                     self._total_specialists_pruned += 1
+                    # Decrement specialist count so growth is no longer blocked
+                    self._specialist_count[mechanic_tag_id] = max(
+                        0, self._specialist_count.get(mechanic_tag_id, 0) - 1
+                    )
                     return True
                 break
 

@@ -365,9 +365,10 @@ class Governor:
         )
         self._last_rl_loss = loss
 
-        # Freeze structural changes if regressing
-        # (reward EMA is declining significantly)
-        self._frozen = False  # Let SRP handle this; Governor defers
+        # Freeze/unfreeze is managed explicitly via freeze_structural_changes()
+        # and unfreeze_structural_changes() calls from the SRP/meta-loop.
+        # Do NOT unconditionally clear _frozen here, otherwise freeze is
+        # immediately undone on every update_regression_state() call.
 
     def freeze_structural_changes(self):
         """Freeze all structural changes (called by SRP on regression)."""

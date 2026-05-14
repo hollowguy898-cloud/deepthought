@@ -58,8 +58,8 @@ class WorkingMemory(nn.Module):
             nn.Sigmoid(),
         )
         
-        # Residual connection coefficient
-        self.alpha = nn.Parameter(torch.tensor(0.1))
+        # Residual connection coefficient (raw logit; sigmoid applied in forward)
+        self._alpha_logit = nn.Parameter(torch.tensor(-2.2))  # sigmoid(-2.2) ≈ 0.1
         
         # Normalization
         self.norm = RMSNorm(latent_dim)
@@ -90,11 +90,16 @@ class WorkingMemory(nn.Module):
         h_t = h_t.squeeze(0)
         
         # Compute update gate
+        # NOTE: The external update gate can override the GRU output entirely.
+        # When update ≈ 0, the GRU computation is negated and h_prev is preserved.
+        # This is intentional — the gate controls how much the GRU result influences
+        # the state. The sigmoid-constrained alpha further bounds the residual step size.
         gate_input = torch.cat([h_prev, x_t, memory_read], dim=-1)
         update = self.update_gate(gate_input)
         
-        # Residual update
-        delta_h = self.alpha * (h_t - h_prev) * update
+        # Residual update — sigmoid ensures alpha stays in (0, 1)
+        alpha = torch.sigmoid(self._alpha_logit)
+        delta_h = alpha * (h_t - h_prev) * update
         
         # Apply update
         h_t = h_prev + delta_h

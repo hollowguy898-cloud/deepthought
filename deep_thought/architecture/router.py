@@ -161,12 +161,15 @@ class NoisyTopKRouter(nn.Module):
 
         Encourages uniform expert usage to prevent collapse.
         """
+        # Add epsilon to prevent log(0) when expert_usage is all zeros
+        safe_usage = self.expert_usage + 1e-8
+
         # Ideal uniform distribution
         target = torch.ones_like(self.expert_usage) / self.num_experts
 
         # KL divergence
         loss = F.kl_div(
-            self.expert_usage.log(),
+            safe_usage.log(),
             target,
             reduction="batchmean"
         )

@@ -199,6 +199,7 @@ class FormalVerificationLayer(nn.Module):
         # Violation tracking
         self._violation_history: List[Dict] = []
         self._steps_since_violation: int = 0
+        self._has_ever_violated: bool = False  # Cooldown only applies AFTER first violation
         self._total_changes_approved: int = 0
         self._total_changes_rejected: int = 0
 
@@ -404,8 +405,8 @@ class FormalVerificationLayer(nn.Module):
         if not self.config.use_formal_verification:
             return True, {"skipped": True}
 
-        # Cooldown after violation
-        if self._steps_since_violation < self.config.constraint_violation_cooldown:
+        # Cooldown after violation (only enforce if a violation has ever occurred)
+        if self._has_ever_violated and self._steps_since_violation < self.config.constraint_violation_cooldown:
             self._steps_since_violation += 1
             return False, {"reason": "cooldown_after_violation"}
 
@@ -452,6 +453,7 @@ class FormalVerificationLayer(nn.Module):
         else:
             self._total_changes_rejected += 1
             self._steps_since_violation = 0
+            self._has_ever_violated = True
             self._violation_history.append({
                 "change_type": change_type,
                 "violations": all_violations,

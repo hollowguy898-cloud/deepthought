@@ -155,7 +155,7 @@ class CuriosityConfig:
     uncertainty_coef: float = 0.05
     info_gain_coef: float = 0.02
     curiosity_decay: float = 0.999
-    visit_count_hash_size: int = 10000
+    visit_count_hash_size: int = 1000000
     min_curiosity: float = 0.001
     max_intrinsic_reward: float = 1.0
     state_embedding_dim: int = 64

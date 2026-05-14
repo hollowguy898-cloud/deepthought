@@ -141,8 +141,10 @@ class PPOTrainer:
         self.action_space = action_space
         self.action_dim = action_dim
         
-        # Rollout buffer
-        self.buffer = RolloutBuffer(capacity=config.batch_size)
+        # Rollout buffer — capacity must accommodate at least one full rollout
+        # so that the rollout is not truncated when batch_size < rollout_length
+        buffer_capacity = max(config.batch_size, config.rollout_length)
+        self.buffer = RolloutBuffer(capacity=buffer_capacity)
         
         # GAE parameters
         self.gamma = config.gamma

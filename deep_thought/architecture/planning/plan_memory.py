@@ -69,6 +69,7 @@ class PlanMemory(nn.Module):
             context_hash=context_hash,
         )
         
+        plan.usage_count += 1
         self.plans.append(plan)
         
         # Evict if over capacity
@@ -90,12 +91,21 @@ class PlanMemory(nn.Module):
         Returns:
             Retrieved plans
         """
-        # Find plans with similar context
+        # Find plans with similar context.
+        # WARNING: Integer hash proximity is NOT semantic similarity — two
+        # contexts that are semantically unrelated can have numerically
+        # close hashes due to hash collisions.  This filter should be
+        # replaced with an embedding-based similarity measure for
+        # production use.
         similar = [
             p for p in self.plans
             if abs(p.context_hash - context_hash) < 100
         ]
         
+        # Increment usage_count for retrieved plans
+        for p in similar[:k]:
+            p.usage_count += 1
+
         # Sort by reward and success
         similar.sort(
             key=lambda p: (p.success, p.reward),

@@ -227,8 +227,9 @@ class SelfRegressionPrevention(nn.Module):
             self.best_performance = performance
             self.best_checkpoint_id = checkpoint_id
         
-        # Prune old checkpoints
-        if len(self.checkpoints) > 10:
+        # Prune old checkpoints — keep at most 3 to limit memory consumption
+        # (each checkpoint contains a full deepcopy of model + optimizer state_dicts)
+        if len(self.checkpoints) > 3:
             oldest_id = min(self.checkpoints.keys())
             del self.checkpoints[oldest_id]
         
