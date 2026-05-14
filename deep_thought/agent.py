@@ -415,6 +415,8 @@ class DeepThoughtAgent(nn.Module):
 
         # Encode observation
         x_t, encoder_info = self.encoder(observation)
+        x_t = torch.nan_to_num(x_t, nan=0.0, posinf=1e6, neginf=-1e6)
+        outputs["latent"] = x_t
         outputs["encoder_info"] = encoder_info
 
         # Update memory

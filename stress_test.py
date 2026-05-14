@@ -758,6 +758,106 @@ def test_agent_episode():
     print(f"  Agent stats keys: {list(stats.keys())}")
 
 
+@test("Full Agent - PPO training updates all core submodules")
+def test_agent_ppo_learning_updates_submodules():
+    import gymnasium as gym
+    import torch.optim as optim
+    from deep_thought.agent import DeepThoughtAgent
+    from deep_thought.config import DeepThoughtConfig
+    from deep_thought.optimization.ppo import PPOTrainer
+
+    config = DeepThoughtConfig()
+    config.observation_dim = 4
+    config.action_dim = 2
+    config.num_actions = 2
+    config.action_space = "discrete"
+    config.encoder.latent_dim = 32
+    config.encoder.hidden_dim = 64
+    config.router.num_experts = 4
+    config.router.active_experts = 2
+    config.router.hidden_dim = 32
+    config.expert.hidden_dim = 64
+    config.memory.working_memory_size = 32
+    config.memory.episodic_capacity = 16
+    config.memory.semantic_capacity = 8
+    config.world_model.hidden_dim = 64
+    config.planning.use_tcpl = False
+    config.feature_validation.use_fve = False
+    config.expert_compiler.use_fec = False
+    config.meta_learning.use_meta_learning = False
+    config.srp.use_srp = False
+    config.curiosity.use_curiosity = False
+    config.hierarchical.use_hierarchy = False
+    config.opponent_modeling.use_opponent_modeling = False
+    config.compute_economy.use_compute_market = False
+    config.subgoal.use_subgoals = False
+    config.attention_maps.use_attention_maps = False
+    config.governance.use_governor = False
+    config.meta_loop.use_meta_loop = False
+    config.formal_verification.use_formal_verification = False
+    config.shadow_evolution.use_shadow_evolution = False
+    config.dynamic_hyperparams.use_dynamic_hyperparams = False
+    config.mechanic_discovery.use_mde = False
+    config.autonomous_specialization.use_autonomous_specialization = False
+    config.training.batch_size = 8
+    config.training.rollout_length = 8
+    config.training.ppo_epochs = 1
+
+    env = gym.make("CartPole-v1")
+    agent = DeepThoughtAgent(config)
+    optimizer = optim.Adam(agent.parameters(), lr=1e-3)
+    trainer = PPOTrainer(
+        config.training,
+        agent,
+        action_space=config.action_space,
+        action_dim=config.action_dim,
+    )
+
+    observation, _ = env.reset()
+    observation = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
+    agent.reset(1)
+
+    router_before = next(agent.router.parameters()).detach().clone()
+    world_before = next(agent.world_model.parameters()).detach().clone()
+
+    trainer.collect_rollout(env, observation, agent.h_t, agent.m_t, torch.device("cpu"))
+    batch = trainer.buffer.get_batch()
+    selected_expert_ids = set()
+    expert_before = {}
+    for exp_id in batch["selected_indices"].flatten().tolist():
+        expert = agent.expert_bank._get_expert(int(exp_id))
+        if expert is not None:
+            selected_expert_ids.add(int(exp_id))
+            expert_before[int(exp_id)] = [param.detach().clone() for param in expert.parameters()]
+    assert selected_expert_ids
+
+    metrics = trainer.update(optimizer)
+
+    router_delta = (next(agent.router.parameters()).detach() - router_before).abs().sum().item()
+    expert_delta = 0.0
+    for exp_id in selected_expert_ids:
+        selected_expert = agent.expert_bank._get_expert(exp_id)
+        if selected_expert is None:
+            continue
+        expert_delta += sum(
+            (param.detach() - before).abs().sum().item()
+            for param, before in zip(selected_expert.parameters(), expert_before[exp_id])
+        )
+    world_delta = (next(agent.world_model.parameters()).detach() - world_before).abs().sum().item()
+    utilities = [stats.utility_score for stats in agent.expert_bank.expert_stats.values()]
+
+    assert router_delta > 0.0, "router parameters did not learn"
+    assert expert_delta > 0.0, "expert parameters did not learn"
+    assert world_delta > 0.0, "world model parameters did not learn"
+    assert any(abs(utility) > 0.0 for utility in utilities), "expert utility stats did not update"
+    assert "epoch_0_world_model_loss" in metrics
+    env.close()
+    print(
+        f"  Updates: router={router_delta:.6f}, expert={expert_delta:.6f}, "
+        f"world={world_delta:.6f}"
+    )
+
+
 @test("Full Agent - Continuous action space")
 def test_agent_continuous():
     from deep_thought.agent import DeepThoughtAgent
@@ -1549,6 +1649,7 @@ if __name__ == "__main__":
         test_agent_construction,
         test_agent_forward,
         test_agent_episode,
+        test_agent_ppo_learning_updates_submodules,
         test_agent_continuous,
         test_config_yaml,
         test_srp,
