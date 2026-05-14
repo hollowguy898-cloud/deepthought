@@ -343,6 +343,132 @@ class MetaLearningRulesConfig:
 
 
 @dataclass
+class MetaLoopConfig:
+    """Capability Density Meta-Loop configuration.
+
+    Controls the meta-RL loop that treats Capability Density as the
+    primary reward signal for architectural changes.
+
+    Attributes:
+        use_meta_loop: Whether to enable the meta-loop.
+        density_reward_coef: Coefficient for the density reward.
+        density_regression_threshold: Fraction drop from max to trigger regression.
+        meta_lr: Learning rate for the meta-optimizer.
+        meta_action_dim: Dimensionality of meta-action embedding.
+        history_length: Number of density observations for trend detection.
+        min_density_improvement: Minimum relative improvement to approve change.
+        density_ema_decay: EMA decay for density tracking.
+    """
+    use_meta_loop: bool = True
+    density_reward_coef: float = 0.1
+    density_regression_threshold: float = 0.15
+    meta_lr: float = 1e-5
+    meta_action_dim: int = 64
+    history_length: int = 200
+    min_density_improvement: float = 0.01
+    density_ema_decay: float = 0.999
+
+
+@dataclass
+class FormalVerificationConfig:
+    """Formal Verification Layer configuration.
+
+    Controls the verification layer that enforces logic-based constraints
+    and entropy regulation before architectural changes.
+
+    Attributes:
+        use_formal_verification: Whether to enable the formal verification layer.
+        kl_epsilon: Maximum KL divergence from stable baseline.
+        kl_check_interval: How often to check KL divergence.
+        max_output_norm: Maximum expert output norm.
+        min_capability_density: Minimum density below which growth is blocked.
+        gradient_explosion_threshold: Maximum gradient norm.
+        verification_tier: Default verification tier (syntactic/semantic/causal).
+        constraint_violation_cooldown: Steps to wait after violation.
+    """
+    use_formal_verification: bool = True
+    kl_epsilon: float = 0.1
+    kl_check_interval: int = 100
+    max_output_norm: float = 100.0
+    min_capability_density: float = 0.001
+    gradient_explosion_threshold: float = 10.0
+    verification_tier: str = "semantic"
+    constraint_violation_cooldown: int = 500
+
+
+@dataclass
+class ShadowEvolutionConfig:
+    """Shadow Evolution configuration.
+
+    Controls the evolutionary search system that mutates dormant experts
+    in the background and swaps them in when they outperform active ones.
+
+    Attributes:
+        use_shadow_evolution: Whether to enable shadow evolution.
+        max_shadow_experts: Maximum shadow experts to maintain.
+        mutation_rate: Probability of mutating each weight.
+        mutation_strength: Std dev of Gaussian noise for weight mutations.
+        tournament_size: Number of experts compared in tournament selection.
+        validation_window: Number of validation samples per evaluation.
+        swap_threshold: Minimum improvement ratio for swap approval.
+        evolution_interval: Steps between evolution cycles.
+        max_mutations_per_cycle: Maximum mutations per cycle.
+        archive_size: Number of best shadows to archive.
+    """
+    use_shadow_evolution: bool = True
+    max_shadow_experts: int = 16
+    mutation_rate: float = 0.1
+    mutation_strength: float = 0.01
+    tournament_size: int = 4
+    validation_window: int = 100
+    swap_threshold: float = 0.1
+    evolution_interval: int = 1000
+    max_mutations_per_cycle: int = 4
+    archive_size: int = 5
+
+
+@dataclass
+class DynamicHyperparamsConfig:
+    """Dynamic Hyperparameter Adaptation configuration.
+
+    Controls the system that dynamically adjusts learning rates, pruning
+    thresholds, and other hyperparameters based on task volatility.
+
+    Attributes:
+        use_dynamic_hyperparams: Whether to enable dynamic hyperparams.
+        volatility_window: Number of observations for volatility estimation.
+        volatility_ema_decay: EMA decay for volatility tracking.
+        lr_min: Minimum allowed learning rate.
+        lr_max: Maximum allowed learning rate.
+        lr_adjustment_rate: How quickly the meta-controller adjusts LR.
+        pruning_threshold_min: Minimum pruning utility threshold.
+        pruning_threshold_max: Maximum pruning utility threshold.
+        pruning_threshold_adjustment_rate: How quickly pruning threshold adapts.
+        warmup_trigger_threshold: Prediction error increase to trigger warmup.
+        warmup_duration: Steps the re-warmup phase lasts.
+        warmup_lr_multiplier: LR multiplier during warmup.
+        warmup_freeze_architecture: Freeze architecture during warmup.
+        curvature_window: Observations for loss curvature estimation.
+        meta_controller_hidden_dim: Hidden dim of the meta-controller network.
+    """
+    use_dynamic_hyperparams: bool = True
+    volatility_window: int = 100
+    volatility_ema_decay: float = 0.99
+    lr_min: float = 1e-6
+    lr_max: float = 1e-2
+    lr_adjustment_rate: float = 0.01
+    pruning_threshold_min: float = 0.02
+    pruning_threshold_max: float = 0.30
+    pruning_threshold_adjustment_rate: float = 0.001
+    warmup_trigger_threshold: float = 0.5
+    warmup_duration: int = 1000
+    warmup_lr_multiplier: float = 3.0
+    warmup_freeze_architecture: bool = True
+    curvature_window: int = 50
+    meta_controller_hidden_dim: int = 64
+
+
+@dataclass
 class GovernanceConfig:
     """Architectural Governance configuration.
 
@@ -491,6 +617,12 @@ class DeepThoughtConfig:
     meta_learning_rules: MetaLearningRulesConfig = field(default_factory=MetaLearningRulesConfig)
     governance: GovernanceConfig = field(default_factory=GovernanceConfig)
     
+    # Stable self-improvement components
+    meta_loop: MetaLoopConfig = field(default_factory=MetaLoopConfig)
+    formal_verification: FormalVerificationConfig = field(default_factory=FormalVerificationConfig)
+    shadow_evolution: ShadowEvolutionConfig = field(default_factory=ShadowEvolutionConfig)
+    dynamic_hyperparams: DynamicHyperparamsConfig = field(default_factory=DynamicHyperparamsConfig)
+    
     # Training
     training: TrainingConfig = field(default_factory=TrainingConfig)
     
@@ -540,6 +672,10 @@ class DeepThoughtConfig:
             "attention_maps": AttentionMapsConfig,
             "meta_learning_rules": MetaLearningRulesConfig,
             "governance": GovernanceConfig,
+            "meta_loop": MetaLoopConfig,
+            "formal_verification": FormalVerificationConfig,
+            "shadow_evolution": ShadowEvolutionConfig,
+            "dynamic_hyperparams": DynamicHyperparamsConfig,
         }
         
         config = cls()

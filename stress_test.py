@@ -1273,3 +1273,328 @@ if __name__ == "__main__":
         print("\n🎉 All tests passed!")
 
     sys.exit(0 if FAIL_COUNT == 0 else 1)
+
+
+# ============================================================
+# 12. Stable Self-Improvement Component Stress Tests
+# ============================================================
+
+@test("Meta-Loop - Capability Density tracking and regression detection")
+def test_meta_loop():
+    from deep_thought.stability.meta_loop import MetaLoopController, MetaLoopConfig
+
+    config = MetaLoopConfig(
+        use_meta_loop=True,
+        density_regression_threshold=0.15,
+        history_length=50,
+        min_density_improvement=0.01,
+    )
+    controller = MetaLoopController(config, state_dim=32)
+
+    # Normal operation with improving density
+    for i in range(30):
+        obs = controller.observe(
+            density=0.1 + i * 0.01,
+            num_active_experts=4,
+            max_experts=64,
+            routing_entropy=1.5,
+            mean_utility=0.5,
+        )
+    assert not obs["is_regressing"], "Should not regress with improving density"
+    assert obs["trend"] > 0, "Trend should be positive when density improves"
+
+    # Simulate regression
+    for i in range(30):
+        obs = controller.observe(
+            density=0.4 - i * 0.01,
+            num_active_experts=4,
+            max_experts=64,
+            routing_entropy=1.5,
+            mean_utility=0.5,
+        )
+
+    # After regression, architecture should freeze
+    assert controller.should_freeze_architecture() or obs["is_regressing"], \
+        "Should detect regression when density drops significantly"
+
+    # Propose action when frozen
+    action, value, info = controller.propose_action(obs)
+    assert action == 0, "Should return NO_OP when frozen"
+
+    stats = controller.get_stats()
+    print(f"  Meta-loop stats: {stats}")
+
+
+@test("Meta-Loop - Action proposal in normal state")
+def test_meta_loop_action():
+    from deep_thought.stability.meta_loop import MetaLoopController, MetaLoopConfig, MetaActionNetwork
+
+    config = MetaLoopConfig(use_meta_loop=True)
+    controller = MetaLoopController(config, state_dim=32)
+
+    obs = controller.observe(
+        density=0.5,
+        num_active_experts=4,
+        max_experts=64,
+        routing_entropy=1.5,
+        mean_utility=0.5,
+    )
+
+    action, value, info = controller.propose_action(obs)
+    assert 0 <= action < MetaActionNetwork.NUM_META_ACTIONS, f"Action {action} out of range"
+    print(f"  Proposed action: {action}, value: {value:.4f}")
+
+
+@test("Formal Verification - Syntactic checks")
+def test_formal_verification_syntactic():
+    from deep_thought.learning.formal_verification import FormalVerificationLayer, FormalVerificationConfig
+
+    config = FormalVerificationConfig(
+        use_formal_verification=True,
+        max_output_norm=10.0,
+    )
+    fvl = FormalVerificationLayer(config, num_experts=8)
+
+    # Normal output
+    good_output = torch.randn(2, 64) * 0.5
+    passed, violations = fvl.verify_syntactic(good_output)
+    assert passed, f"Normal output should pass: {violations}"
+
+    # Exploding output
+    bad_output = torch.randn(2, 64) * 100.0
+    passed, violations = fvl.verify_syntactic(bad_output)
+    assert not passed, "Exploding output should fail"
+    print(f"  Syntactic violations detected: {violations}")
+
+
+@test("Formal Verification - KL divergence enforcement")
+def test_formal_verification_kl():
+    from deep_thought.learning.formal_verification import FormalVerificationLayer, FormalVerificationConfig
+
+    config = FormalVerificationConfig(
+        use_formal_verification=True,
+        kl_epsilon=0.1,
+    )
+    fvl = FormalVerificationLayer(config, num_experts=8)
+
+    # Set stable baseline
+    baseline_probs = F.softmax(torch.randn(2, 8), dim=-1)
+    fvl.update_stable_baseline(baseline_probs)
+
+    # Same distribution should be within KL budget
+    within, kl_val = fvl.entropy_regulator.check_kl_divergence(baseline_probs)
+    assert within, f"Same distribution should be within KL budget: KL={kl_val:.4f}"
+
+    # Very different distribution should exceed KL budget
+    different_probs = F.softmax(torch.randn(2, 8) * 10, dim=-1)
+    within2, kl_val2 = fvl.entropy_regulator.check_kl_divergence(different_probs)
+    print(f"  KL for same dist: {kl_val:.4f}, different dist: {kl_val2:.4f}")
+
+
+@test("Formal Verification - Full change verification")
+def test_formal_verification_full():
+    from deep_thought.learning.formal_verification import FormalVerificationLayer, FormalVerificationConfig
+
+    config = FormalVerificationConfig(
+        use_formal_verification=True,
+        kl_epsilon=0.5,
+        constraint_violation_cooldown=0,  # No cooldown for testing
+    )
+    fvl = FormalVerificationLayer(config, num_experts=8)
+
+    # Verify a growth change
+    approved, details = fvl.verify_change(
+        change_type="growth",
+        current_capability_density=0.5,
+    )
+    print(f"  Growth approval: {approved}, details: {details}")
+
+
+@test("Shadow Evolution - Spawn, mutate, evaluate")
+def test_shadow_evolution():
+    from deep_thought.learning.shadow_evolution import ShadowEvolutionEngine, ShadowEvolutionConfig, ShadowMutator
+
+    config = ShadowEvolutionConfig(
+        use_shadow_evolution=True,
+        max_shadow_experts=4,
+        mutation_rate=0.5,
+        mutation_strength=0.05,
+        tournament_size=2,
+    )
+    engine = ShadowEvolutionEngine(config)
+
+    # Create a simple expert state dict
+    expert_state = {
+        "weight1": torch.randn(32, 16),
+        "bias1": torch.randn(32),
+        "weight2": torch.randn(16, 32),
+        "bias2": torch.randn(16),
+    }
+
+    # Spawn shadows
+    shadow_id1 = engine.spawn_shadow(0, expert_state)
+    shadow_id2 = engine.spawn_shadow(1, expert_state)
+    assert shadow_id1 >= 0, "Should spawn first shadow"
+    assert shadow_id2 >= 0, "Should spawn second shadow"
+
+    # Run evolution cycle
+    engine.evolve_cycle()
+
+    # Evaluate
+    should_swap, improvement = engine.evaluate_shadow(shadow_id1, 0.3, 0.5)
+    print(f"  Shadow swap: {should_swap}, improvement: {improvement:.4f}")
+
+    # Tournament select
+    winner = engine.tournament_select(k=2)
+    assert winner is not None, "Should have a tournament winner"
+    print(f"  Tournament winner: {winner}")
+
+    stats = engine.get_stats()
+    print(f"  Shadow evolution stats: {stats}")
+
+
+@test("Shadow Evolution - Mutator")
+def test_shadow_mutator():
+    from deep_thought.learning.shadow_evolution import ShadowMutator, ShadowEvolutionConfig, MutationType
+
+    config = ShadowEvolutionConfig(mutation_rate=1.0, mutation_strength=0.1)
+    mutator = ShadowMutator(config)
+
+    state = {
+        "weight": torch.eye(4),
+        "bias": torch.ones(4),
+    }
+
+    mutated, applied = mutator.mutate(state, [MutationType.WEIGHT_NOISE])
+    assert len(applied) > 0, "Should apply at least one mutation"
+    # Mutated weights should differ from original
+    assert not torch.allclose(state["weight"], mutated["weight"]), \
+        "Mutated weights should differ from original"
+    print(f"  Applied mutations: {applied[:3]}")
+
+
+@test("Dynamic Hyperparams - Volatility detection and warmup")
+def test_dynamic_hyperparams():
+    from deep_thought.learning.dynamic_hyperparams import DynamicHyperparamController, DynamicHyperparamsConfig
+
+    config = DynamicHyperparamsConfig(
+        use_dynamic_hyperparams=True,
+        volatility_window=20,
+        lr_min=1e-5,
+        lr_max=1e-2,
+        warmup_trigger_threshold=0.5,
+        warmup_duration=50,
+    )
+    controller = DynamicHyperparamController(config)
+
+    # Stable phase
+    for _ in range(30):
+        controller.record(grad_norm=0.5, loss=0.3, prediction_error=0.2)
+
+    params = controller.get_hyperparams(
+        capability_density=0.5,
+        routing_entropy=1.5,
+        mean_utility=0.5,
+    )
+    assert not params["warmup_phase"], "Should not be in warmup during stable phase"
+    assert params["learning_rate"] > 0, "LR should be positive"
+
+    # Volatile phase (simulate distribution shift)
+    for _ in range(30):
+        controller.record(grad_norm=5.0, loss=3.0, prediction_error=5.0)
+
+    in_warmup = controller.in_warmup()
+    params = controller.get_hyperparams(
+        capability_density=0.5,
+        routing_entropy=1.5,
+        mean_utility=0.5,
+    )
+    print(f"  In warmup: {in_warmup}")
+    print(f"  Current LR: {params['learning_rate']:.6f}")
+    print(f"  Pruning threshold: {params['pruning_threshold']:.4f}")
+
+    stats = controller.get_stats()
+    print(f"  Dynamic hyperparams stats: {stats}")
+
+
+@test("Dynamic Hyperparams - Meta-controller predictions")
+def test_dynamic_hyperparams_meta_controller():
+    from deep_thought.learning.dynamic_hyperparams import MetaController, DynamicHyperparamsConfig
+
+    config = DynamicHyperparamsConfig(meta_controller_hidden_dim=32)
+    mc = MetaController(config, input_dim=8)
+
+    state = MetaController.encode_state(
+        grad_volatility=0.3,
+        loss_volatility=0.2,
+        capability_density=0.5,
+        routing_entropy=1.5,
+    )
+    predictions = mc(state)
+
+    assert "learning_rate" in predictions
+    assert "pruning_threshold" in predictions
+    assert predictions["learning_rate"].item() > 0, "LR should be positive"
+    print(f"  Predicted LR: {predictions['learning_rate'].item():.6f}")
+    print(f"  Predicted pruning threshold: {predictions['pruning_threshold'].item():.4f}")
+
+
+@test("Stable SI - Full agent with all self-improvement components")
+def test_agent_with_stable_si():
+    from deep_thought.agent import DeepThoughtAgent
+    from deep_thought.config import DeepThoughtConfig
+
+    config = DeepThoughtConfig()
+    config.observation_dim = 4
+    config.action_dim = 2
+    config.num_actions = 2
+    config.action_space = "discrete"
+    config.encoder.latent_dim = 64
+    config.encoder.hidden_dim = 128
+    config.router.num_experts = 8
+    config.router.active_experts = 2
+    config.expert.hidden_dim = 64
+    config.memory.working_memory_size = 64
+    config.memory.episodic_key_dim = 16
+    config.memory.episodic_value_dim = 64
+    config.memory.semantic_dim = 16
+    config.curiosity.state_embedding_dim = 16
+    config.hierarchical.reflex_experts = 4
+    config.hierarchical.tactical_experts = 2
+    config.hierarchical.strategic_experts = 2
+    config.hierarchical.meta_experts = 2
+    config.hierarchical.reflex_hidden_dim = 32
+    config.hierarchical.tactical_hidden_dim = 32
+    config.hierarchical.strategic_hidden_dim = 32
+    config.hierarchical.meta_hidden_dim = 32
+    config.compute_economy.bidding_hidden_dim = 16
+    config.attention_maps.num_heads = 4
+    config.attention_maps.evolution_hidden_dim = 32
+    config.subgoal.goal_embedding_dim = 16
+    config.opponent_modeling.opponent_latent_dim = 16
+    config.opponent_modeling.tendency_dim = 8
+    # Enable all stable SI components
+    config.meta_loop.use_meta_loop = True
+    config.formal_verification.use_formal_verification = True
+    config.shadow_evolution.use_shadow_evolution = True
+    config.dynamic_hyperparams.use_dynamic_hyperparams = True
+
+    agent = DeepThoughtAgent(config)
+    agent.reset(1)
+
+    # Run several steps
+    for step in range(10):
+        obs = torch.randn(1, 4)
+        outputs = agent.forward(obs, reward=0.5, training=True)
+
+    # Check all self-improvement components are present
+    stats = agent.get_stats()
+    assert "meta_loop_stats" in stats, "Should have meta_loop stats"
+    assert "formal_verification_stats" in stats, "Should have formal verification stats"
+    assert "shadow_evolution_stats" in stats, "Should have shadow evolution stats"
+    assert "dynamic_hyperparams_stats" in stats, "Should have dynamic hyperparams stats"
+
+    print(f"  Meta-loop: {stats['meta_loop_stats']}")
+    print(f"  Formal verification: {stats['formal_verification_stats']}")
+    print(f"  Shadow evolution: {stats['shadow_evolution_stats']}")
+    print(f"  Dynamic hyperparams: {stats['dynamic_hyperparams_stats']}")

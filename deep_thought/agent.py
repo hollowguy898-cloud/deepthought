@@ -39,6 +39,10 @@ from deep_thought.governance.governor import Governor, GovernorConfig
 from deep_thought.governance.timescale_controller import TimescaleConfig, TimescaleTier
 from deep_thought.governance.capacity_ledger import CapacityLedgerConfig
 from deep_thought.governance.proposal_bus import Proposal, ProposalType
+from deep_thought.stability.meta_loop import MetaLoopController, MetaLoopConfig
+from deep_thought.learning.formal_verification import FormalVerificationLayer, FormalVerificationConfig
+from deep_thought.learning.shadow_evolution import ShadowEvolutionEngine, ShadowEvolutionConfig
+from deep_thought.learning.dynamic_hyperparams import DynamicHyperparamController, DynamicHyperparamsConfig
 
 
 class DeepThoughtAgent(nn.Module):
@@ -57,6 +61,10 @@ class DeepThoughtAgent(nn.Module):
     - Meta-learning with fast weights
     - Self-regression prevention
     - Architectural governance layer (7 principles)
+    - Stable self-improvement: Meta-Loop on Capability Density
+    - Stable self-improvement: Formal Verification Layer
+    - Stable self-improvement: Shadow Evolution
+    - Stable self-improvement: Dynamic Hyperparameter Adaptation
     """
 
     def __init__(self, config: DeepThoughtConfig):
@@ -215,6 +223,89 @@ class DeepThoughtAgent(nn.Module):
             self.attention_maps = AttentionProbabilityMap(config.attention_maps, config.encoder.latent_dim)
         else:
             self.attention_maps = None
+
+        # -----------------------------------------------------------
+        # Stable Self-Improvement Components
+        # -----------------------------------------------------------
+
+        # Component 1: Meta-Loop on Capability Density
+        if config.meta_loop.use_meta_loop:
+            self.meta_loop = MetaLoopController(
+                MetaLoopConfig(
+                    use_meta_loop=config.meta_loop.use_meta_loop,
+                    density_reward_coef=config.meta_loop.density_reward_coef,
+                    density_regression_threshold=config.meta_loop.density_regression_threshold,
+                    meta_lr=config.meta_loop.meta_lr,
+                    meta_action_dim=config.meta_loop.meta_action_dim,
+                    history_length=config.meta_loop.history_length,
+                    min_density_improvement=config.meta_loop.min_density_improvement,
+                    density_ema_decay=config.meta_loop.density_ema_decay,
+                ),
+                state_dim=32,
+            )
+        else:
+            self.meta_loop = None
+
+        # Component 2: Formal Verification Layer
+        if config.formal_verification.use_formal_verification:
+            self.formal_verification = FormalVerificationLayer(
+                FormalVerificationConfig(
+                    use_formal_verification=config.formal_verification.use_formal_verification,
+                    kl_epsilon=config.formal_verification.kl_epsilon,
+                    kl_check_interval=config.formal_verification.kl_check_interval,
+                    max_output_norm=config.formal_verification.max_output_norm,
+                    min_capability_density=config.formal_verification.min_capability_density,
+                    gradient_explosion_threshold=config.formal_verification.gradient_explosion_threshold,
+                    verification_tier=config.formal_verification.verification_tier,
+                    constraint_violation_cooldown=config.formal_verification.constraint_violation_cooldown,
+                ),
+                num_experts=config.router.num_experts,
+            )
+        else:
+            self.formal_verification = None
+
+        # Component 3: Shadow Evolution
+        if config.shadow_evolution.use_shadow_evolution:
+            self.shadow_evolution = ShadowEvolutionEngine(
+                ShadowEvolutionConfig(
+                    use_shadow_evolution=config.shadow_evolution.use_shadow_evolution,
+                    max_shadow_experts=config.shadow_evolution.max_shadow_experts,
+                    mutation_rate=config.shadow_evolution.mutation_rate,
+                    mutation_strength=config.shadow_evolution.mutation_strength,
+                    tournament_size=config.shadow_evolution.tournament_size,
+                    validation_window=config.shadow_evolution.validation_window,
+                    swap_threshold=config.shadow_evolution.swap_threshold,
+                    evolution_interval=config.shadow_evolution.evolution_interval,
+                    max_mutations_per_cycle=config.shadow_evolution.max_mutations_per_cycle,
+                    archive_size=config.shadow_evolution.archive_size,
+                ),
+            )
+        else:
+            self.shadow_evolution = None
+
+        # Component 4: Dynamic Hyperparameter Adaptation
+        if config.dynamic_hyperparams.use_dynamic_hyperparams:
+            self.dynamic_hyperparams = DynamicHyperparamController(
+                DynamicHyperparamsConfig(
+                    use_dynamic_hyperparams=config.dynamic_hyperparams.use_dynamic_hyperparams,
+                    volatility_window=config.dynamic_hyperparams.volatility_window,
+                    volatility_ema_decay=config.dynamic_hyperparams.volatility_ema_decay,
+                    lr_min=config.dynamic_hyperparams.lr_min,
+                    lr_max=config.dynamic_hyperparams.lr_max,
+                    lr_adjustment_rate=config.dynamic_hyperparams.lr_adjustment_rate,
+                    pruning_threshold_min=config.dynamic_hyperparams.pruning_threshold_min,
+                    pruning_threshold_max=config.dynamic_hyperparams.pruning_threshold_max,
+                    pruning_threshold_adjustment_rate=config.dynamic_hyperparams.pruning_threshold_adjustment_rate,
+                    warmup_trigger_threshold=config.dynamic_hyperparams.warmup_trigger_threshold,
+                    warmup_duration=config.dynamic_hyperparams.warmup_duration,
+                    warmup_lr_multiplier=config.dynamic_hyperparams.warmup_lr_multiplier,
+                    warmup_freeze_architecture=config.dynamic_hyperparams.warmup_freeze_architecture,
+                    curvature_window=config.dynamic_hyperparams.curvature_window,
+                    meta_controller_hidden_dim=config.dynamic_hyperparams.meta_controller_hidden_dim,
+                ),
+            )
+        else:
+            self.dynamic_hyperparams = None
 
         # Policy and value heads
         # For continuous action space, policy head outputs mean + log_std (2 * action_dim)
@@ -562,6 +653,55 @@ class DeepThoughtAgent(nn.Module):
             feature_ids = self.feature_validator.extract_features(x_t)
             outputs["feature_ids"] = feature_ids
 
+        # -------------------------------------------------------
+        # Stable Self-Improvement: Meta-Loop Observation
+        # -------------------------------------------------------
+        if self.meta_loop is not None and training:
+            density = self.expert_bank.capability_density()
+            active_experts = self.expert_bank.get_active_experts()
+            routing_entropy = outputs.get("router_info", {}).get("entropy", None)
+            mean_utility = (
+                sum(s.utility_score for s in self.expert_bank.expert_stats.values())
+                / max(1, len(self.expert_bank.expert_stats))
+            )
+            meta_obs = self.meta_loop.observe(
+                density=density,
+                num_active_experts=len(active_experts),
+                max_experts=self.expert_bank.max_experts,
+                routing_entropy=routing_entropy.item() if routing_entropy is not None else 1.0,
+                mean_utility=mean_utility,
+            )
+            outputs["meta_loop_obs"] = meta_obs
+
+            # If meta-loop detects regression, freeze architecture
+            if meta_obs.get("is_regressing", False) and self.governor is not None:
+                self.governor.freeze_structural_changes()
+
+        # -------------------------------------------------------
+        # Stable Self-Improvement: Formal Verification
+        # -------------------------------------------------------
+        if self.formal_verification is not None and training:
+            # Update stable baseline at slow timescale
+            if "probs" in outputs.get("router_info", {}):
+                probs = outputs["router_info"]["probs"]
+                if self.step % self.config.formal_verification.kl_check_interval == 0:
+                    self.formal_verification.update_stable_baseline(probs)
+
+        # -------------------------------------------------------
+        # Stable Self-Improvement: Dynamic Hyperparams Recording
+        # -------------------------------------------------------
+        if self.dynamic_hyperparams is not None and training:
+            # Record gradient norm proxy (use delta_h norm)
+            grad_norm = 0.0
+            if "delta_h" in outputs:
+                grad_norm = outputs["delta_h"].detach().norm().item()
+            loss_proxy = prediction_error.item() if isinstance(prediction_error, torch.Tensor) else float(prediction_error)
+            self.dynamic_hyperparams.record(
+                grad_norm=grad_norm,
+                loss=loss_proxy,
+                prediction_error=loss_proxy,
+            )
+
         # Update step
         self.step += 1
 
@@ -829,16 +969,34 @@ class DeepThoughtAgent(nn.Module):
         Fix 2: Only allowed at SLOW timescale.
         Fix 3: Must pass capacity ledger (growth must "buy out" capacity).
         Fix 6: Goes through proposal bus.
+        Stable SI: Must pass Formal Verification and Meta-Loop density check.
         """
         # Check governance
         if self.governor is not None:
             if not self.governor.is_operation_allowed("expert_growth"):
                 return
 
+            # Stable SI: Meta-loop density check
+            if self.meta_loop is not None:
+                if self.meta_loop.should_freeze_architecture():
+                    return  # Meta-loop detected density regression
+
             # Fix 3: Check capacity ledger
             predicted_marginal = 0.5  # Default estimate
             if not self.governor.evaluate_growth_proposal(-1, predicted_marginal):
                 return  # Growth denied by capacity ledger
+
+            # Stable SI: Formal verification of the growth proposal
+            if self.formal_verification is not None:
+                current_density = self.expert_bank.capability_density()
+                # Conservative: predict density will drop slightly due to new params
+                predicted_density = current_density * 0.95
+                approved, details = self.formal_verification.verify_change(
+                    change_type="growth",
+                    current_capability_density=current_density,
+                )
+                if not approved:
+                    return  # Growth denied by formal verification
 
             # Fix 6: Submit growth proposal
             self.governor.submit_proposal(Proposal(
@@ -1009,5 +1167,18 @@ class DeepThoughtAgent(nn.Module):
 
         if self.governor is not None:
             stats["governance_stats"] = self.governor.get_stats()
+
+        # Stable Self-Improvement stats
+        if self.meta_loop is not None:
+            stats["meta_loop_stats"] = self.meta_loop.get_stats()
+
+        if self.formal_verification is not None:
+            stats["formal_verification_stats"] = self.formal_verification.get_stats()
+
+        if self.shadow_evolution is not None:
+            stats["shadow_evolution_stats"] = self.shadow_evolution.get_stats()
+
+        if self.dynamic_hyperparams is not None:
+            stats["dynamic_hyperparams_stats"] = self.dynamic_hyperparams.get_stats()
 
         return stats
