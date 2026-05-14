@@ -800,15 +800,6 @@ class HierarchicalExpertSociety(nn.Module):
             torch.ones(len(TierLevel)) * self.config.compute_budget_total / len(TierLevel)
         )
 
-        # Learned linear projections to replace adaptive_avg_pool1d
-        # (which destroys information by averaging). These preserve
-        # information through learnable weight matrices.
-        if self.use_hierarchy and self.config.num_tiers >= 4:
-            self.meta_context_proj = nn.Linear(self.config.meta_hidden_dim, latent_dim, bias=False)
-            self.meta_output_proj = nn.Linear(self.config.meta_hidden_dim, latent_dim, bias=False)
-        if self.use_hierarchy and self.config.num_tiers >= 3:
-            self.goals_proj = nn.Linear(latent_dim, latent_dim, bias=False)
-
     # ------------------------------------------------------------------
     # Expert registry helpers
     # ------------------------------------------------------------------
@@ -887,8 +878,10 @@ class HierarchicalExpertSociety(nn.Module):
 
         # ---- Strategic tier (Level 2) ----
         if self.config.num_tiers >= 3 and hasattr(self, "strategic_tier"):
-            # Condition strategic input with meta context (learned projection)
-            meta_ctx_proj = self.meta_context_proj(meta_context) if meta_context.size(-1) != self.latent_dim else meta_context
+            # Condition strategic input with meta context (projected to latent_dim)
+            meta_ctx_proj = F.adaptive_avg_pool1d(
+                meta_context.unsqueeze(1), self.latent_dim
+            ).squeeze(1) if meta_context.size(-1) != self.latent_dim else meta_context
             strategic_input = torch.cat([h_t, meta_ctx_proj], dim=-1)
 
             # If meta tier produced expert gates, use them to mask strategic experts
@@ -947,16 +940,20 @@ class HierarchicalExpertSociety(nn.Module):
         budget_strategic = compute_budgets.get("strategic", 0.25)
         budget_meta = compute_budgets.get("meta", 0.25)
 
-        # Meta contribution: the meta_context (learned projection)
+        # Meta contribution: the meta_context (projected back to latent_dim)
         if meta_context.size(-1) != self.latent_dim:
-            meta_output = self.meta_output_proj(meta_context)
+            meta_output = F.adaptive_avg_pool1d(
+                meta_context.unsqueeze(1), self.latent_dim
+            ).squeeze(1)
         else:
             meta_output = meta_context
 
         output = (
             budget_reflex * reflex_output
             + budget_tactical * tactical_output
-            + budget_strategic * self.goals_proj(goals)
+            + budget_strategic * F.adaptive_avg_pool1d(
+                goals.unsqueeze(1), self.latent_dim
+            ).squeeze(1)
             + budget_meta * meta_output
         )
 

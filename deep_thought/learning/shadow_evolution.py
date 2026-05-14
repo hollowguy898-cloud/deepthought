@@ -70,7 +70,7 @@ class ShadowEvolutionConfig:
     """
     use_shadow_evolution: bool = True
     max_shadow_experts: int = 16
-    mutation_rate: float = 0.03  # 3% per parameter per mutation application
+    mutation_rate: float = 0.1
     mutation_strength: float = 0.01
     tournament_size: int = 4
     validation_window: int = 100
@@ -78,11 +78,6 @@ class ShadowEvolutionConfig:
     evolution_interval: int = 1000
     max_mutations_per_cycle: int = 4
     archive_size: int = 5
-    min_shadow_age: int = 2
-    replacement_cooldown: int = 3
-    min_evaluations_before_swap: int = 3
-    fitness_ema_alpha: float = 0.1
-    max_mutation_history: int = 128
 
 
 @dataclass
@@ -105,7 +100,6 @@ class ShadowExpert:
     age: int = 0
     mutation_history: List[str] = field(default_factory=list)
     validation_scores: List[float] = field(default_factory=list)
-    last_improvement: float = 0.0
 
 
 class ShadowMutator:
@@ -178,8 +172,8 @@ class ShadowMutator:
                 applied.append(f"widening({key})")
 
             elif mtype == MutationType.ACTIVATION_SWAP:
-                # Flip sign of a small fraction of weights (simulates activation change)
-                mask = torch.rand_like(tensor) > 0.9  # Only 10% flip rate (was 50%)
+                # Flip sign of some weights (simulates activation change)
+                mask = torch.rand_like(tensor) > 0.5
                 mutated[key] = tensor * mask.float() - tensor * (~mask).float()
                 applied.append(f"activation_swap({key})")
 
@@ -214,25 +208,6 @@ class ShadowEvolutionEngine:
         self._total_swaps_proposed: int = 0
         self._total_swaps_approved: int = 0
         self._cycle_count: int = 0
-        self._last_replacement_cycle: Dict[int, int] = {}
-        self._proposal_history: Dict[int, int] = {}
-
-    def _can_propose_swap(self, shadow: ShadowExpert) -> bool:
-        if shadow.age < self.config.min_shadow_age:
-            return False
-        if len(shadow.validation_scores) < self.config.min_evaluations_before_swap:
-            return False
-
-        last_cycle = self._last_replacement_cycle.get(shadow.parent_id)
-        if last_cycle is not None:
-            if self._cycle_count - last_cycle < self.config.replacement_cooldown:
-                return False
-
-        recent_scores = shadow.validation_scores[-self.config.min_evaluations_before_swap:]
-        if any(not math.isfinite(score) for score in recent_scores):
-            return False
-
-        return shadow.fitness > self.config.swap_threshold
 
     def spawn_shadow(
         self,
@@ -271,7 +246,6 @@ class ShadowEvolutionEngine:
             state_dict=cpu_state,
         )
         self._shadow_population[shadow_id] = shadow
-        self._proposal_history.setdefault(parent_id, 0)
 
         return shadow_id
 
@@ -300,19 +274,9 @@ class ShadowEvolutionEngine:
                 new_state, mutations = self.mutator.mutate(shadow.state_dict)
                 shadow.state_dict = new_state
                 shadow.mutation_history.extend(mutations)
-                if len(shadow.mutation_history) > self.config.max_mutation_history:
-                    shadow.mutation_history = shadow.mutation_history[-self.config.max_mutation_history:]
                 self._total_mutations += 1
 
             shadow.age += 1
-
-            # Evaluate shadow and propose swap if it outperforms parent
-            if self._can_propose_swap(shadow):
-                swap_proposals.append((shadow_id, shadow.parent_id))
-                self._total_swaps_proposed += 1
-                self._proposal_history[shadow.parent_id] = (
-                    self._proposal_history.get(shadow.parent_id, 0) + 1
-                )
 
         return swap_proposals
 
@@ -334,13 +298,9 @@ class ShadowEvolutionEngine:
         """
         if shadow_id not in self._shadow_population:
             return False, 0.0
-        if not math.isfinite(validation_loss) or not math.isfinite(active_parent_loss):
-            return False, 0.0
 
         shadow = self._shadow_population[shadow_id]
         shadow.validation_scores.append(validation_loss)
-        if len(shadow.validation_scores) > self.config.validation_window:
-            shadow.validation_scores = shadow.validation_scores[-self.config.validation_window:]
 
         # Compute fitness (lower loss = higher fitness)
         if active_parent_loss > 1e-8:
@@ -348,17 +308,12 @@ class ShadowEvolutionEngine:
         else:
             improvement = 0.0
 
-        alpha = min(max(self.config.fitness_ema_alpha, 0.0), 1.0)
-        shadow.fitness = shadow.fitness * (1.0 - alpha) + improvement * alpha
-        shadow.last_improvement = improvement
+        shadow.fitness = shadow.fitness * 0.9 + improvement * 0.1  # EMA
 
         # Should we propose a swap?
-        should_swap = self._can_propose_swap(shadow)
+        should_swap = improvement > self.config.swap_threshold
         if should_swap:
             self._total_swaps_proposed += 1
-            self._proposal_history[shadow.parent_id] = (
-                self._proposal_history.get(shadow.parent_id, 0) + 1
-            )
 
         return should_swap, improvement
 
@@ -404,7 +359,6 @@ class ShadowEvolutionEngine:
         state = shadow.state_dict
         del self._shadow_population[shadow_id]
         self._total_swaps_approved += 1
-        self._last_replacement_cycle[shadow.parent_id] = self._cycle_count
 
         return state
 
@@ -417,8 +371,6 @@ class ShadowEvolutionEngine:
             "total_swaps_proposed": self._total_swaps_proposed,
             "total_swaps_approved": self._total_swaps_approved,
             "cycle_count": self._cycle_count,
-            "replacement_cooldowns": dict(self._last_replacement_cycle),
-            "proposal_history": dict(self._proposal_history),
         }
 
     def reset(self):
@@ -429,5 +381,3 @@ class ShadowEvolutionEngine:
         self._total_swaps_proposed = 0
         self._total_swaps_approved = 0
         self._cycle_count = 0
-        self._last_replacement_cycle.clear()
-        self._proposal_history.clear()

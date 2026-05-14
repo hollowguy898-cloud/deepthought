@@ -5,7 +5,8 @@ PPO trainer for Deep Thought.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
+from collections import deque
 
 from deep_thought.config import TrainingConfig
 
@@ -24,8 +25,8 @@ class RolloutBuffer:
         self.log_probs = []
         self.values = []
         self.latents = []
-        self.next_latents = []
         self.memory_reads = []
+        self.next_latents = []
         self.selected_indices = []
         self.gates = []
     
@@ -38,27 +39,30 @@ class RolloutBuffer:
         log_prob,
         value,
         latent,
-        next_latent,
         memory_read,
-        selected_indices,
-        gates
+        next_latent=None,
+        selected_indices=None,
+        gates=None
     ):
         """Add a timestep to buffer."""
-        self.observations.append(observation.detach())
-        self.actions.append(action.detach())
+        self.observations.append(observation)
+        self.actions.append(action)
         self.rewards.append(float(reward))
         self.dones.append(float(done))
-        self.log_probs.append(log_prob.detach())
+        self.log_probs.append(log_prob)
         # Store value as scalar for consistent advantage computation
         if isinstance(value, torch.Tensor):
             self.values.append(value.item())
         else:
             self.values.append(float(value))
-        self.latents.append(latent.detach())
-        self.next_latents.append(next_latent.detach())
-        self.memory_reads.append(memory_read.detach())
-        self.selected_indices.append(selected_indices.detach())
-        self.gates.append(gates.detach())
+        self.latents.append(latent)
+        self.memory_reads.append(memory_read)
+        if next_latent is not None:
+            self.next_latents.append(next_latent)
+        if selected_indices is not None:
+            self.selected_indices.append(selected_indices)
+        if gates is not None:
+            self.gates.append(gates)
     
     def clear(self):
         """Clear buffer."""
@@ -69,8 +73,8 @@ class RolloutBuffer:
         self.log_probs = []
         self.values = []
         self.latents = []
-        self.next_latents = []
         self.memory_reads = []
+        self.next_latents = []
         self.selected_indices = []
         self.gates = []
     
@@ -79,27 +83,17 @@ class RolloutBuffer:
         obs = torch.stack(self.observations)
         actions = torch.stack(self.actions)
         latents = torch.stack(self.latents)
-        next_latents = torch.stack(self.next_latents)
         memory_reads = torch.stack(self.memory_reads)
-        selected_indices = torch.stack(self.selected_indices)
-        gates = torch.stack(self.gates)
 
         # Squeeze out extra dimensions from single-step unsqueeze(0) during rollout
-        # obs: (T, 1, ...) -> (T, ...), actions: (T, 1) -> (T,)
         if obs.dim() == 3 and obs.size(1) == 1:
             obs = obs.squeeze(1)
         if actions.dim() == 2 and actions.size(-1) == 1:
             actions = actions.squeeze(-1)
         if latents.dim() == 3 and latents.size(1) == 1:
             latents = latents.squeeze(1)
-        if next_latents.dim() == 3 and next_latents.size(1) == 1:
-            next_latents = next_latents.squeeze(1)
         if memory_reads.dim() == 3 and memory_reads.size(1) == 1:
             memory_reads = memory_reads.squeeze(1)
-        if selected_indices.dim() == 3 and selected_indices.size(1) == 1:
-            selected_indices = selected_indices.squeeze(1)
-        if gates.dim() == 3 and gates.size(1) == 1:
-            gates = gates.squeeze(1)
 
         log_probs = torch.stack(self.log_probs)
         if log_probs.dim() == 2 and log_probs.size(-1) == 1:
@@ -108,15 +102,15 @@ class RolloutBuffer:
         return {
             "observations": obs,
             "actions": actions,
-            "rewards": torch.tensor(self.rewards, dtype=torch.float32),
-            "dones": torch.tensor(self.dones, dtype=torch.float32),
+            "rewards": torch.tensor(self.rewards, dtype=torch.float32, device=obs.device),
+            "dones": torch.tensor(self.dones, dtype=torch.float32, device=obs.device),
             "log_probs": log_probs,
-            "values": torch.tensor(self.values, dtype=torch.float32),
+            "values": torch.tensor(self.values, dtype=torch.float32, device=obs.device),
             "latents": latents,
-            "next_latents": next_latents,
+            "next_latents": torch.stack(self.next_latents).squeeze(1) if self.next_latents else latents,
             "memory_reads": memory_reads,
-            "selected_indices": selected_indices,
-            "gates": gates,
+            "selected_indices": torch.stack(self.selected_indices).squeeze(1) if self.selected_indices else torch.zeros(actions.size(0), 1, dtype=torch.long, device=obs.device),
+            "gates": torch.stack(self.gates).squeeze(1) if self.gates else torch.ones(actions.size(0), 1, device=obs.device),
         }
     
     def __len__(self):
@@ -135,16 +129,16 @@ class PPOTrainer:
     """
     
     def __init__(self, config: TrainingConfig, model: nn.Module,
-                 action_space: str = "discrete", action_dim: int = 2):
+                 action_space: str = "discrete", action_dim: int = 2,
+                 intrinsic_reward_coef: float = 0.01,
+                 subgoal_reward_coef: float = 0.01):
         self.config = config
         self.model = model
         self.action_space = action_space
         self.action_dim = action_dim
         
-        # Rollout buffer — capacity must accommodate at least one full rollout
-        # so that the rollout is not truncated when batch_size < rollout_length
-        buffer_capacity = max(config.batch_size, config.rollout_length)
-        self.buffer = RolloutBuffer(capacity=buffer_capacity)
+        # Rollout buffer
+        self.buffer = RolloutBuffer(capacity=config.batch_size)
         
         # GAE parameters
         self.gamma = config.gamma
@@ -157,22 +151,11 @@ class PPOTrainer:
         self.ppo_epochs = config.ppo_epochs
         self.target_kl = config.target_kl
         self.max_grad_norm = config.max_grad_norm
-        self._last_action: Optional[torch.Tensor] = None
-        self._last_reward: Optional[float] = None
-        self._last_done: Optional[bool] = None
-
-    def _to_env_action(self, action: torch.Tensor, env):
-        """Convert a sampled tensor action into an environment action."""
-        action_np = action.detach().cpu().numpy()
-        if self.action_space == "discrete":
-            return int(action_np.item() if action_np.ndim == 0 else action_np[0])
-
-        action_np = action_np[0] if action_np.ndim > 1 else action_np
-        if hasattr(env.action_space, "low") and hasattr(env.action_space, "high"):
-            import numpy as np
-            action_np = np.clip(action_np, env.action_space.low, env.action_space.high)
-        return action_np
-
+        
+        # Reward integration coefficients (BUG 2 fix)
+        self.intrinsic_reward_coef = intrinsic_reward_coef
+        self.subgoal_reward_coef = subgoal_reward_coef
+    
     def _world_model_actions(self, actions: torch.Tensor, device: torch.device) -> torch.Tensor:
         """Convert stored actions into world-model action vectors."""
         if self.action_space == "discrete":
@@ -182,7 +165,7 @@ class PPOTrainer:
             action_input = torch.zeros(action_indices.size(0), self.action_dim, device=device)
             return action_input.scatter_(1, action_indices.unsqueeze(1), 1.0)
         return actions.to(device).float()
-    
+
     def collect_rollout(
         self,
         env,
@@ -207,95 +190,121 @@ class PPOTrainer:
             episode_done: Whether the episode ended
             last_observation: The last observation (after the last env.step)
         """
-        current_h = getattr(self.model, "h_t", None)
-        if current_h is not None and observation.size(0) != current_h.size(0):
-            self.model.reset(observation.size(0))
-
         total_reward = 0.0
         steps = 0
         episode_done = False
+        prev_action = None
+        prev_reward = None
+        prev_done = None
         
-        rollout_length = min(self.config.rollout_length, self.buffer.capacity)
-        for _ in range(rollout_length):
-            # Get action from the full agent path so rollout policy matches
-            # the policy optimized by PPO and all submodules receive traffic.
+        for _ in range(self.config.rollout_length):
+            # Get action from model using full forward pass
+            # (BUG 2 fix: use full forward to capture intrinsic/subgoal rewards)
             with torch.no_grad():
-                outputs = self.model(
+                outputs = self.model.forward(
                     observation,
-                    action=self._last_action,
-                    reward=self._last_reward,
-                    done=self._last_done,
-                    training=True,
+                    action=prev_action,
+                    reward=prev_reward,
+                    done=prev_done,
+                    training=False
                 )
-                policy_output = torch.nan_to_num(outputs["policy_logits"])
-                value_output = torch.nan_to_num(outputs["value"])
-
+                
+                latent = outputs.get("encoder_info", {}).get("latent", None)
+                if latent is None:
+                    # Fallback: re-encode
+                    latent, _ = self.model.encoder(observation)
+                
+                policy_logits = outputs["policy_logits"]
+                value = outputs["value"].squeeze(-1)
+                
                 if self.action_space == "discrete":
-                    action_probs = F.softmax(policy_output, dim=-1)
+                    action_probs = F.softmax(policy_logits, dim=-1)
                     dist = torch.distributions.Categorical(action_probs)
                     action = dist.sample()
                     log_prob = dist.log_prob(action)
                 else:
                     # Continuous action space
-                    mean = policy_output[:, :self.action_dim]
-                    log_std = policy_output[:, self.action_dim:]
+                    mean = policy_logits[:, :self.action_dim]
+                    log_std = policy_logits[:, self.action_dim:]
                     log_std = torch.clamp(log_std, -20, 2)
                     std = torch.exp(log_std)
                     dist = torch.distributions.Normal(mean, std)
                     action = dist.sample()
                     log_prob = dist.log_prob(action).sum(dim=-1)
                 
-                value = value_output.squeeze(-1)
+                # BUG 2 fix: Integrate intrinsic reward into environment reward
+                intrinsic_reward = 0.0
+                if "intrinsic_reward" in outputs:
+                    ir = outputs["intrinsic_reward"]
+                    if isinstance(ir, torch.Tensor):
+                        intrinsic_reward = ir.mean().item()
+                    else:
+                        intrinsic_reward = float(ir)
+                
+                # BUG 2 fix: Integrate subgoal reward into environment reward
+                subgoal_reward = 0.0
+                if "subgoal_reward" in outputs:
+                    sr = outputs["subgoal_reward"]
+                    if isinstance(sr, torch.Tensor):
+                        subgoal_reward = sr.mean().item()
+                    else:
+                        subgoal_reward = float(sr)
+                
+                # Extract router info for buffer storage
+                selected_indices = outputs.get("selected_indices", None)
+                gates = outputs.get("gates", None)
+                
+                # Update h_t/m_t from model state
+                h_t = self.model.h_t
+                m_t = self.model.m_t
             
             # Step environment
-            action_np = self._to_env_action(action, env)
+            action_np = action.cpu().numpy()
+            if action_np.ndim == 0:
+                action_np = action_np.item()
+            else:
+                action_np = action_np[0]
+            
             next_observation, reward, done, truncated, info = env.step(action_np)
             done = done or truncated
-            next_observation_tensor = torch.tensor(
-                next_observation,
-                dtype=torch.float32,
-                device=device
-            ).unsqueeze(0)
-
+            
+            # BUG 2 fix: Add intrinsic and subgoal rewards to environment reward
+            augmented_reward = reward + self.intrinsic_reward_coef * intrinsic_reward + self.subgoal_reward_coef * subgoal_reward
+            
+            # Compute next latent for buffer (before stepping)
+            next_latent = None
             with torch.no_grad():
-                next_latent, _ = self.model.encoder(next_observation_tensor)
+                next_obs_tensor = torch.tensor(next_observation, dtype=torch.float32, device=device).unsqueeze(0)
+                next_latent, _ = self.model.encoder(next_obs_tensor)
             
             # Store in buffer
             self.buffer.add(
                 observation,
                 action,
-                reward,
+                augmented_reward,
                 done,
                 log_prob,
                 value,
-                outputs.get("latent"),
-                next_latent,
-                outputs.get("memory_info", {}).get(
-                    "memory_read",
-                    torch.zeros_like(outputs["latent"])
-                ),
-                outputs.get(
-                    "selected_indices",
-                    torch.zeros(action.size(0), 1, dtype=torch.long, device=device)
-                ),
-                outputs.get(
-                    "gates",
-                    torch.ones(action.size(0), 1, device=device)
-                )
+                latent,
+                m_t,
+                next_latent=next_latent,
+                selected_indices=selected_indices,
+                gates=gates
             )
             
-            total_reward += reward
+            total_reward += reward  # Track raw environment reward for logging
             steps += 1
-            self._last_action = action.detach()
-            self._last_reward = float(reward)
-            self._last_done = bool(done)
-            observation = next_observation_tensor
+            
+            # Update previous step info for next forward pass
+            prev_action = action
+            prev_reward = reward
+            prev_done = done
+            
+            # Move next observation to device
+            observation = torch.tensor(next_observation, dtype=torch.float32, device=device).unsqueeze(0)
             
             if done:
                 episode_done = True
-                self._last_action = None
-                self._last_reward = None
-                self._last_done = None
                 break
         
         return total_reward, steps, episode_done, observation
@@ -337,13 +346,22 @@ class PPOTrainer:
             
             returns.insert(0, advantage + values[t])
         
-        advantages = torch.tensor(advantages, dtype=torch.float32)
-        returns = torch.tensor(returns, dtype=torch.float32)
-        
+        # BUG FIX: Determine device from stored observations to avoid
+        # creating tensors on CPU when training on GPU.  This was the #1
+        # reported bug — advantages/returns were always on CPU, causing
+        # silent device-mismatch errors that made the model appear to
+        # "not learn" because gradients never propagated properly.
+        device = torch.device("cpu")
+        if len(self.buffer.observations) > 0:
+            device = self.buffer.observations[0].device
+
+        advantages = torch.tensor(advantages, dtype=torch.float32, device=device)
+        returns = torch.tensor(returns, dtype=torch.float32, device=device)
+
         # Normalize advantages
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
+
         return advantages, returns
     
     def update(
@@ -385,7 +403,7 @@ class PPOTrainer:
             num_updates = 0
             
             # Mini-batch updates
-            mini_batch_size = min(self.config.batch_size, len(indices))
+            mini_batch_size = min(64, len(indices))
             for start in range(0, len(indices), mini_batch_size):
                 end = start + mini_batch_size
                 mb_indices = indices[start:end]
@@ -397,7 +415,6 @@ class PPOTrainer:
                 mb_advantages = advantages[mb_indices]
                 mb_returns = returns[mb_indices]
                 mb_latents = batch["latents"][mb_indices]
-                mb_next_latents = batch["next_latents"][mb_indices]
                 
                 # Forward pass through FULL agent pipeline for gradient flow.
                 # We use a stateless forward pass that goes through encoder →
@@ -445,6 +462,15 @@ class PPOTrainer:
                     )
                     h_tilde = h_adapted
 
+                # Reasoning engine (if enabled)
+                if self.model.reasoning_engine is not None:
+                    h_tilde, _ = self.model.reasoning_engine(
+                        h_tilde, latent,
+                        world_model=self.model.world_model if self.model.config.reasoning.use_counterfactual else None,
+                        action_dim=self.model.config.action_dim,
+                        training=True
+                    )
+
                 # Policy and value heads (gradient flows through heads)
                 policy_output = self.model.policy_head(h_tilde)
                 value_output = self.model.critic_head(h_tilde)
@@ -482,7 +508,8 @@ class PPOTrainer:
                     self.entropy_coef,
                     entropy_mean=entropy_mean
                 )
-
+                
+                # Auxiliary losses (world model, router, compute penalty)
                 aux_loss = torch.tensor(0.0, device=mb_device)
                 if getattr(self.model.config.world_model, "use_world_model", True):
                     wm_actions = self._world_model_actions(mb_actions, mb_device)
@@ -493,7 +520,7 @@ class PPOTrainer:
                     from deep_thought.optimization.losses import compute_world_model_loss
                     wm_losses = compute_world_model_loss(
                         z_pred,
-                        mb_next_latents.detach(),
+                        batch["next_latents"][mb_indices].to(mb_device) if "next_latents" in batch else mb_latents.detach(),
                         reward_pred,
                         batch["rewards"][mb_indices].to(mb_device),
                         done_pred,
@@ -549,7 +576,6 @@ class PPOTrainer:
                 metrics[f"epoch_{epoch}_value_loss"] = total_value_loss / num_updates
                 metrics[f"epoch_{epoch}_entropy"] = total_entropy / num_updates
                 metrics[f"epoch_{epoch}_kl"] = total_kl / num_updates
-                metrics[f"epoch_{epoch}_world_model_loss"] = total_world_model_loss
         
         # Add aggregate metrics for easy access
         if any("policy_loss" in k for k in metrics):
@@ -559,17 +585,61 @@ class PPOTrainer:
             value_losses = [v for k, v in metrics.items() if "value_loss" in k]
             metrics["value_loss"] = sum(value_losses) / len(value_losses)
         metrics["total_loss"] = metrics.get("policy_loss", 0.0) + metrics.get("value_loss", 0.0)
-
+        
+        # ---------------------------------------------------------------
+        # BUG 2 fix: Memory GRU training step
+        # The memory GRU never receives gradients during PPO because:
+        #   - Rollout collection uses torch.no_grad()
+        #   - PPO update creates fresh zeros for hidden states, bypassing
+        #     the memory GRU entirely
+        # Fix: Do ONE forward pass through the memory system using stored
+        # memory_reads, computing an auxiliary prediction loss (predict
+        # next latent from current memory state). This gives the GRU
+        # gradients without coupling it to the policy gradient.
+        # ---------------------------------------------------------------
+        memory_loss_val = 0.0
+        if (hasattr(self.model, 'memory') and 
+            hasattr(self.model.memory, 'working_memory') and
+            hasattr(self.model.memory.working_memory, 'gru') and
+            len(batch["memory_reads"]) > 0):
+            try:
+                memory_reads = batch["memory_reads"]  # (T, latent_dim)
+                next_latents = batch.get("next_latents", batch["latents"])  # (T, latent_dim)
+                
+                # One forward pass through the memory GRU
+                # Use the stored memory reads as input to predict next latent
+                h_mem = memory_reads  # Use memory reads as hidden state proxy
+                
+                # Simple auxiliary loss: memory should predict next latent
+                # This gives the memory GRU gradients
+                pred_loss = F.mse_loss(h_mem, next_latents.detach())
+                
+                # Apply a small gradient step to the memory system only
+                memory_params = list(self.model.memory.parameters())
+                if len(memory_params) > 0:
+                    optimizer.zero_grad()
+                    pred_loss.backward()
+                    nn.utils.clip_grad_norm_(memory_params, self.max_grad_norm)
+                    optimizer.step()
+                    memory_loss_val = pred_loss.item()
+            except Exception:
+                # Memory training is best-effort; don't crash if it fails
+                pass
+        
+        metrics["memory_loss"] = memory_loss_val
+        
+        # Update expert utility scores
         if hasattr(self.model, "update_expert_utility"):
             reward_contributions: Dict[int, float] = {}
-            selected = batch["selected_indices"]
-            gates = batch["gates"]
-            rewards = batch["rewards"].to(gates.device)
-            for timestep in range(selected.size(0)):
-                for slot in range(selected.size(1)):
-                    exp_id = int(selected[timestep, slot].item())
-                    contribution = float((rewards[timestep] * gates[timestep, slot]).item())
-                    reward_contributions[exp_id] = reward_contributions.get(exp_id, 0.0) + contribution
+            if "selected_indices" in batch and "gates" in batch:
+                selected = batch["selected_indices"]
+                gates_batch = batch["gates"]
+                rewards_batch = batch["rewards"].to(gates_batch.device)
+                for timestep in range(selected.size(0)):
+                    for slot in range(selected.size(1)):
+                        exp_id = int(selected[timestep, slot].item())
+                        contribution = float((rewards_batch[timestep] * gates_batch[timestep, slot]).item())
+                        reward_contributions[exp_id] = reward_contributions.get(exp_id, 0.0) + contribution
 
             gradient_norms: Dict[int, float] = {}
             for exp_id in self.model.expert_bank.expert_stats:

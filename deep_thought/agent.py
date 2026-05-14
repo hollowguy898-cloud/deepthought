@@ -43,8 +43,7 @@ from deep_thought.stability.meta_loop import MetaLoopController, MetaLoopConfig
 from deep_thought.learning.formal_verification import FormalVerificationLayer, FormalVerificationConfig
 from deep_thought.learning.shadow_evolution import ShadowEvolutionEngine, ShadowEvolutionConfig
 from deep_thought.learning.dynamic_hyperparams import DynamicHyperparamController, DynamicHyperparamsConfig
-from deep_thought.mechanic_discovery.mde import MechanicDiscoveryEngine
-from deep_thought.learning.autonomous_specialization import AutonomousSpecialization
+from deep_thought.reasoning.reasoning_engine import ReasoningEngine
 
 
 class DeepThoughtAgent(nn.Module):
@@ -67,9 +66,7 @@ class DeepThoughtAgent(nn.Module):
     - Stable self-improvement: Formal Verification Layer
     - Stable self-improvement: Shadow Evolution
     - Stable self-improvement: Dynamic Hyperparameter Adaptation
-    - Black Box: Mechanic Discovery Engine (MDE)
-    - Black Box: Autonomous Expert Specialization
-    - Black Box: Stability in the Dark (SRP enhancements)
+    - Reasoning Engine: Multi-step deliberation before action selection
     """
 
     def __init__(self, config: DeepThoughtConfig):
@@ -196,7 +193,6 @@ class DeepThoughtAgent(nn.Module):
         if config.curiosity.use_curiosity:
             self.curiosity = IntrinsicMotivationSystem(config.curiosity)
             self.curiosity_proj = nn.Linear(config.encoder.latent_dim, config.curiosity.state_embedding_dim)
-            self.curiosity_error_proj = nn.Linear(config.encoder.latent_dim, config.curiosity.state_embedding_dim)
         else:
             self.curiosity = None
 
@@ -284,11 +280,6 @@ class DeepThoughtAgent(nn.Module):
                     evolution_interval=config.shadow_evolution.evolution_interval,
                     max_mutations_per_cycle=config.shadow_evolution.max_mutations_per_cycle,
                     archive_size=config.shadow_evolution.archive_size,
-                    min_shadow_age=config.shadow_evolution.min_shadow_age,
-                    replacement_cooldown=config.shadow_evolution.replacement_cooldown,
-                    min_evaluations_before_swap=config.shadow_evolution.min_evaluations_before_swap,
-                    fitness_ema_alpha=config.shadow_evolution.fitness_ema_alpha,
-                    max_mutation_history=config.shadow_evolution.max_mutation_history,
                 ),
             )
         else:
@@ -318,30 +309,15 @@ class DeepThoughtAgent(nn.Module):
         else:
             self.dynamic_hyperparams = None
 
-        # -----------------------------------------------------------
-        # Black Box Components
-        # -----------------------------------------------------------
-
-        # Component 5: Mechanic Discovery Engine (MDE)
-        if config.mechanic_discovery.use_mde:
-            self.mde = MechanicDiscoveryEngine(
-                config.mechanic_discovery
+        # Reasoning Engine
+        if config.reasoning.use_reasoning:
+            self.reasoning_engine = ReasoningEngine(
+                config.reasoning,
+                config.encoder.latent_dim,
+                config.router.num_experts
             )
         else:
-            self.mde = None
-
-        # Component 6: Autonomous Expert Specialization
-        if config.autonomous_specialization.use_autonomous_specialization:
-            self.autonomous_specialization = AutonomousSpecialization(
-                config.autonomous_specialization
-            )
-        else:
-            self.autonomous_specialization = None
-
-        # Component 7: Stability in the Dark (enhancements to SRP)
-        # This is configured through config.stability_in_the_dark but
-        # the actual logic is already in self.srp
-        self.stability_in_the_dark_config = config.stability_in_the_dark
+            self.reasoning_engine = None
 
         # Policy and value heads
         # For continuous action space, policy head outputs mean + log_std (2 * action_dim)
@@ -392,6 +368,9 @@ class DeepThoughtAgent(nn.Module):
         if self.attention_maps is not None:
             self.attention_maps.reset()
 
+        if self.reasoning_engine is not None:
+            self.reasoning_engine.reset()
+
     def forward(
         self,
         observation: torch.Tensor,
@@ -421,8 +400,6 @@ class DeepThoughtAgent(nn.Module):
 
         # Encode observation
         x_t, encoder_info = self.encoder(observation)
-        x_t = torch.nan_to_num(x_t, nan=0.0, posinf=1e6, neginf=-1e6)
-        outputs["latent"] = x_t
         outputs["encoder_info"] = encoder_info
 
         # Update memory
@@ -472,7 +449,8 @@ class DeepThoughtAgent(nn.Module):
         )
         self.h_t = h_t
         # Update m_t with the actual memory read so routing uses real memory
-        self.m_t = memory_info["memory_read"]
+        # BUG 1 fix: detach to prevent graph leaks across steps
+        self.m_t = memory_info["memory_read"].detach()
         outputs["memory_info"] = memory_info
 
         # Get prediction error for adaptation
@@ -485,7 +463,12 @@ class DeepThoughtAgent(nn.Module):
             elementwise_pred_error = torch.zeros_like(x_t)
             prediction_error = torch.tensor(0.0, device=observation.device)
 
-        # (World model prediction moved to single call below to avoid duplicate computation)
+        # Store current prediction for next step comparison
+        if action is not None and self.world_model is not None:
+            with torch.no_grad():
+                self._prev_z_pred = self.world_model(x_t, action_input)[0].detach()
+        else:
+            self._prev_z_pred = None
 
         # --- Attention Probability Maps ---
         # Weight the latent by attention before routing
@@ -505,7 +488,7 @@ class DeepThoughtAgent(nn.Module):
             # Project x_t to curiosity embedding dim
             embedded_latent = self.curiosity_proj(x_t)  # (batch, state_embedding_dim)
             # Project elementwise prediction error to curiosity embedding dim
-            pred_error_proj = self.curiosity_error_proj(elementwise_pred_error)  # (batch, state_embedding_dim)
+            pred_error_proj = self.curiosity_proj(elementwise_pred_error)  # (batch, state_embedding_dim)
             intrinsic_reward, curiosity_info = self.curiosity(
                 latent=embedded_latent,
                 prediction_error=pred_error_proj,
@@ -519,7 +502,8 @@ class DeepThoughtAgent(nn.Module):
 
         # Update context
         if self.meta_learning is not None and self.context is not None:
-            self.context = self.meta_learning.update_context(x_t)
+            # BUG 1 fix: detach x_t to prevent graph leaks across steps
+            self.context = self.meta_learning.update_context(x_t.detach())
 
         # --- Opponent Modeling ---
         opponent_context = None
@@ -546,8 +530,7 @@ class DeepThoughtAgent(nn.Module):
             self.m_t,
             self.context,
             prediction_error,
-            training=training,
-            detach_gates=not training  # Gradient flows during training, detached for inference
+            training=training
         )
         outputs["router_info"] = router_info
         outputs["gates"] = gates
@@ -561,8 +544,7 @@ class DeepThoughtAgent(nn.Module):
             # Build expert_utilities tensor (batch, num_experts)
             utility_tensor = torch.zeros(batch_size, num_experts, device=observation.device)
             for i, stats in self.expert_bank.expert_stats.items():
-                if i < num_experts:  # Only include experts that fit in the tensor
-                    utility_tensor[:, i] = stats.utility_score
+                utility_tensor[:, i] = stats.utility_score
 
             # Build routing_gates tensor (batch, num_experts) from sparse gates
             routing_gates_full = torch.zeros(batch_size, num_experts, device=observation.device)
@@ -595,7 +577,12 @@ class DeepThoughtAgent(nn.Module):
 
         # Apply compute allocations to expert outputs if compute market is enabled
         if self.compute_market is not None and compute_allocations is not None:
-            # Weight delta_h by compute allocations for selected experts
+            # BUG 3 fix: expand compute_allocations from (num_experts,) to
+            # (batch_size, num_experts) before gathering with selected_indices
+            # which is shape (batch_size, active_experts)
+            batch_size = observation.size(0)
+            if compute_allocations.dim() == 1:
+                compute_allocations = compute_allocations.unsqueeze(0).expand(batch_size, -1)
             selected_allocs = compute_allocations.gather(1, selected_indices)  # (batch, active_experts)
             alloc_scale = selected_allocs.mean(dim=-1, keepdim=True)  # (batch, 1)
             mean_alloc = compute_allocations.mean() + 1e-8
@@ -629,6 +616,17 @@ class DeepThoughtAgent(nn.Module):
             )
             h_tilde = h_adapted
             outputs["meta_info"] = meta_info
+
+        # --- Reasoning Engine ---
+        if self.reasoning_engine is not None:
+            refined_h, reasoning_info = self.reasoning_engine(
+                h_tilde, x_t,
+                world_model=self.world_model if self.config.reasoning.use_counterfactual else None,
+                action_dim=self.config.action_dim,
+                training=training
+            )
+            h_tilde = refined_h
+            outputs["reasoning_info"] = reasoning_info
 
         # --- Subgoal Generator ---
         if self.subgoal_generator is not None:
@@ -674,8 +672,7 @@ class DeepThoughtAgent(nn.Module):
         outputs["policy_logits"] = policy_logits
         outputs["value"] = value
 
-        # World model prediction (single call with gradients for training,
-        # detached result stored for next-step prediction error comparison)
+        # World model prediction
         if self.world_model is not None and action is not None:
             z_next, r_pred, d_pred = self.world_model(x_t, action_input)
             outputs["world_model"] = {
@@ -683,10 +680,6 @@ class DeepThoughtAgent(nn.Module):
                 "r_pred": r_pred,
                 "d_pred": d_pred,
             }
-            # Store for next-step prediction error comparison
-            self._prev_z_pred = z_next.detach()
-        else:
-            self._prev_z_pred = None
 
         # Feature extraction
         if self.feature_validator is not None and training:
@@ -741,42 +734,6 @@ class DeepThoughtAgent(nn.Module):
                 loss=loss_proxy,
                 prediction_error=loss_proxy,
             )
-
-        # -------------------------------------------------------
-        # Black Box: Mechanic Discovery Engine
-        # -------------------------------------------------------
-        if self.mde is not None and training and action is not None:
-            # Process step through MDE
-            mde_context = self.context if self.context is not None else x_t.mean(dim=0)
-            if mde_context.dim() == 2:
-                mde_context = mde_context[0]  # Take first in batch
-            mde_action = action_input[0] if action_input.dim() == 2 else action_input
-            mde_obs = x_t[0].detach()
-
-            active_tags, routing_hints = self.mde.process_step(
-                action=mde_action.detach(),
-                observation=mde_obs,
-                context=mde_context.detach(),
-                reward=reward if reward is not None else 0.0,
-            )
-            outputs["mde_active_tags"] = active_tags
-            outputs["mde_routing_hints"] = routing_hints
-
-            # Update expert affinities in MDE based on routing results
-            if active_tags and "selected_indices" in outputs:
-                for tag in active_tags:
-                    for k in range(selected_indices.size(1)):
-                        for idx in selected_indices[:, k].unique().tolist():
-                            expert_success = gates[0, k].item() if gates.size(0) > 0 else 0.5
-                            self.mde._labeler.update_expert_affinity(
-                                tag.tag_id, idx, expert_success
-                            )
-
-        # -------------------------------------------------------
-        # Stability in the Dark: Density Gate Tick
-        # -------------------------------------------------------
-        if self.srp is not None and hasattr(self.srp, 'tick_density_gate'):
-            self.srp.tick_density_gate()
 
         # Update step
         self.step += 1

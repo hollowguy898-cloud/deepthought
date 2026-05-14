@@ -494,7 +494,7 @@ class ExpertBank(nn.Module):
         compressed = {}
         with torch.no_grad():
             for name, param in expert.named_parameters():
-                compressed[name] = param.data.half()  # float16 compression, stay on GPU
+                compressed[name] = param.data.cpu().half()  # float16 compression
         
         self.dormant_cache[expert_id] = compressed
         del self.experts[key]  # Remove from ModuleDict to free VRAM
@@ -515,6 +515,6 @@ class ExpertBank(nn.Module):
         with torch.no_grad():
             for name, param in expert.named_parameters():
                 if name in compressed:
-                    param.data = compressed[name].float()  # Already on correct device (GPU)
+                    param.data = compressed[name].float().to(param.device)
         
         self.experts[str(expert_id)] = expert

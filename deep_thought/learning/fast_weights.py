@@ -124,19 +124,7 @@ class FastWeightMemory(nn.Module):
                     h_t.T,
                     projected
                 ) / h_t.size(0)
-
-                # Clamp Hebbian update to prevent transient instability
-                # from large outer-product values before mixing with decay
-                hebbian_update = torch.clamp(hebbian_update, -1.0, 1.0)
-
-                # DESIGN LIMITATION: The effective learning rate and decay
-                # are coupled — the update rule is
-                #   W' = decay * W + (1 - decay) * update
-                # so changing decay also changes how much the new update
-                # contributes.  To tune LR and decay independently, the
-                # formula would need to be re-parameterised as
-                #   W' = decay * W + lr * update
-                # which is left as a future refactor.
+                
                 # Apply update with decay
                 self.fast_weights.data = (
                     self.decay * self.fast_weights.data +

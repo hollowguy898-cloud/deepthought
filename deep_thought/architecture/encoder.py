@@ -133,14 +133,7 @@ class SparseCoding(nn.Module):
         topk_vals, topk_idx = torch.topk(z.abs(), k, dim=-1)
         sparse_z = torch.zeros_like(z)
         sparse_z.scatter_(-1, topk_idx, z.gather(-1, topk_idx))
-
-        # Straight-through estimator: allow a small residual gradient
-        # for non-winning features so they can recover from "dead" state.
-        # During forward pass sparse_z is unchanged; during backward pass
-        # gradients flow through z with a small residual scale.
-        residual_scale = 0.01
-        sparse_z = sparse_z + (z - z.detach()) * residual_scale
-
+        
         h = self.decoder(sparse_z)
         return h, sparse_z
     

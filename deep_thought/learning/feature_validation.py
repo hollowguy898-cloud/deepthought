@@ -179,8 +179,7 @@ class FeatureValidationEngine(nn.Module):
         feature = self.features[feature_id]
         
         # Update traces
-        # Track actual activation magnitude (mean of feature vector)
-        feature.activation_trace.append(feature.vector.norm().item() if feature.vector.numel() > 0 else 0.0)
+        feature.activation_trace.append(1.0)
         feature.reward_delta_trace.append(reward_delta)
         feature.gradient_norm_trace.append(gradient_norm)
         feature.routing_effect += routing_entropy_delta
@@ -229,24 +228,12 @@ class FeatureValidationEngine(nn.Module):
         # Reuse (number of environments)
         reuse_score = len(feature.environment_tags)
         
-        # Normalize each component to [0, 1] before combining so that
-        # the score is not dominated by whichever component has the
-        # largest raw magnitude.  Without this, gradient_score (which
-        # is a signal-to-noise ratio that can be arbitrarily large)
-        # would swamp reward_score and reuse_score.
-        max_grad = max(abs(gradient_score), 1.0)
-        gradient_score_norm = min(gradient_score / max_grad, 1.0)
-        max_reward = max(abs(reward_score), 1.0)
-        reward_score_norm = min(reward_score / max_reward, 1.0)
-        max_reuse = max(reuse_score, 1.0)
-        reuse_score_norm = min(reuse_score / max_reuse, 1.0)
-
-        # Compute stability using normalized components
+        # Compute stability
         alpha, beta, gamma, delta = 0.3, 0.3, 0.3, 0.1
         stability = (
-            alpha * gradient_score_norm +
-            beta * reward_score_norm +
-            gamma * reuse_score_norm -
+            alpha * gradient_score +
+            beta * reward_score +
+            gamma * reuse_score -
             delta * 1.0
         )
         

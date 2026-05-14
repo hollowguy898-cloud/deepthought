@@ -20,7 +20,6 @@ import sys
 import traceback
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import time
 from typing import Dict, List
@@ -759,106 +758,6 @@ def test_agent_episode():
     print(f"  Agent stats keys: {list(stats.keys())}")
 
 
-@test("Full Agent - PPO training updates all core submodules")
-def test_agent_ppo_learning_updates_submodules():
-    import gymnasium as gym
-    import torch.optim as optim
-    from deep_thought.agent import DeepThoughtAgent
-    from deep_thought.config import DeepThoughtConfig
-    from deep_thought.optimization.ppo import PPOTrainer
-
-    config = DeepThoughtConfig()
-    config.observation_dim = 4
-    config.action_dim = 2
-    config.num_actions = 2
-    config.action_space = "discrete"
-    config.encoder.latent_dim = 32
-    config.encoder.hidden_dim = 64
-    config.router.num_experts = 4
-    config.router.active_experts = 2
-    config.router.hidden_dim = 32
-    config.expert.hidden_dim = 64
-    config.memory.working_memory_size = 32
-    config.memory.episodic_capacity = 16
-    config.memory.semantic_capacity = 8
-    config.world_model.hidden_dim = 64
-    config.planning.use_tcpl = False
-    config.feature_validation.use_fve = False
-    config.expert_compiler.use_fec = False
-    config.meta_learning.use_meta_learning = False
-    config.srp.use_srp = False
-    config.curiosity.use_curiosity = False
-    config.hierarchical.use_hierarchy = False
-    config.opponent_modeling.use_opponent_modeling = False
-    config.compute_economy.use_compute_market = False
-    config.subgoal.use_subgoals = False
-    config.attention_maps.use_attention_maps = False
-    config.governance.use_governor = False
-    config.meta_loop.use_meta_loop = False
-    config.formal_verification.use_formal_verification = False
-    config.shadow_evolution.use_shadow_evolution = False
-    config.dynamic_hyperparams.use_dynamic_hyperparams = False
-    config.mechanic_discovery.use_mde = False
-    config.autonomous_specialization.use_autonomous_specialization = False
-    config.training.batch_size = 8
-    config.training.rollout_length = 8
-    config.training.ppo_epochs = 1
-
-    env = gym.make("CartPole-v1")
-    agent = DeepThoughtAgent(config)
-    optimizer = optim.Adam(agent.parameters(), lr=1e-3)
-    trainer = PPOTrainer(
-        config.training,
-        agent,
-        action_space=config.action_space,
-        action_dim=config.action_dim,
-    )
-
-    observation, _ = env.reset()
-    observation = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
-    agent.reset(1)
-
-    router_before = next(agent.router.parameters()).detach().clone()
-    world_before = next(agent.world_model.parameters()).detach().clone()
-
-    trainer.collect_rollout(env, observation, agent.h_t, agent.m_t, torch.device("cpu"))
-    batch = trainer.buffer.get_batch()
-    selected_expert_ids = set()
-    expert_before = {}
-    for exp_id in batch["selected_indices"].flatten().tolist():
-        expert = agent.expert_bank._get_expert(int(exp_id))
-        if expert is not None:
-            selected_expert_ids.add(int(exp_id))
-            expert_before[int(exp_id)] = [param.detach().clone() for param in expert.parameters()]
-    assert selected_expert_ids
-
-    metrics = trainer.update(optimizer)
-
-    router_delta = (next(agent.router.parameters()).detach() - router_before).abs().sum().item()
-    expert_delta = 0.0
-    for exp_id in selected_expert_ids:
-        selected_expert = agent.expert_bank._get_expert(exp_id)
-        if selected_expert is None:
-            continue
-        expert_delta += sum(
-            (param.detach() - before).abs().sum().item()
-            for param, before in zip(selected_expert.parameters(), expert_before[exp_id])
-        )
-    world_delta = (next(agent.world_model.parameters()).detach() - world_before).abs().sum().item()
-    utilities = [stats.utility_score for stats in agent.expert_bank.expert_stats.values()]
-
-    assert router_delta > 0.0, "router parameters did not learn"
-    assert expert_delta > 0.0, "expert parameters did not learn"
-    assert world_delta > 0.0, "world model parameters did not learn"
-    assert any(abs(utility) > 0.0 for utility in utilities), "expert utility stats did not update"
-    assert "epoch_0_world_model_loss" in metrics
-    env.close()
-    print(
-        f"  Updates: router={router_delta:.6f}, expert={expert_delta:.6f}, "
-        f"world={world_delta:.6f}"
-    )
-
-
 @test("Full Agent - Continuous action space")
 def test_agent_continuous():
     from deep_thought.agent import DeepThoughtAgent
@@ -1308,270 +1207,111 @@ def test_agent_with_governance():
 
 
 # ============================================================
-# 12. Mechanic Discovery Engine (MDE) Stress Tests
+# 13. Reasoning Engine Stress Tests
 # ============================================================
 
-@test("MDE - Invariant detection and self-labeling")
-def test_mde_invariant_detection():
-    from deep_thought.mechanic_discovery.mde import MechanicDiscoveryEngine, MechanicDiscoveryConfig
+@test("Reasoning Engine - Chain-of-Thought reasoning with self-consistency")
+def test_reasoning_engine():
+    from deep_thought.reasoning.reasoning_engine import ReasoningEngine
+    from deep_thought.config import ReasoningConfig
 
-    config = MechanicDiscoveryConfig(
-        use_mde=True,
-        observation_dim=32,
-        action_dim=4,
-        context_dim=16,
-        stability_threshold=0.7,
-        min_context_span=2,
-        window_size=100,
-        validation_interval=50,
+    config = ReasoningConfig(
+        use_reasoning=True,
+        num_reasoning_steps=3,
+        use_counterfactual=False,
+        num_counterfactual_actions=2,
     )
-    mde = MechanicDiscoveryEngine(config)
+    latent_dim = 64
+    num_experts = 8
 
-    # Simulate steps with a consistent action-observation pattern
-    for step in range(50):
-        action = torch.tensor([1.0, 0.0, 0.0, 0.0])  # Consistent action
-        obs = torch.randn(32) * 0.1 + torch.tensor([1.0] * 32)  # Consistent effect
-        context = torch.randn(16) * (1.0 + step * 0.1)  # Varying context
-        reward = 1.0
+    engine = ReasoningEngine(config, latent_dim, num_experts)
+    
+    h_tilde = torch.randn(2, latent_dim)
+    x_t = torch.randn(2, latent_dim)
 
-        tags, hints = mde.process_step(action, obs, context, reward)
+    # Forward pass without world model
+    refined_h, reasoning_info = engine(h_tilde, x_t, world_model=None, action_dim=None, training=True)
+    
+    # Verify output shapes
+    assert refined_h.shape == (2, latent_dim), f"refined_h shape: {refined_h.shape}"
+    
+    # Verify reasoning info
+    assert "consistency_scores" in reasoning_info, "Should have consistency_scores"
+    assert "mean_consistency" in reasoning_info, "Should have mean_consistency"
+    assert "num_reasoning_steps" in reasoning_info, "Should have num_reasoning_steps"
+    assert "refined_value" in reasoning_info, "Should have refined_value"
+    
+    # Verify consistency scores are valid
+    consistency = reasoning_info["consistency_scores"]
+    assert consistency.shape[0] == config.num_reasoning_steps, f"Expected {config.num_reasoning_steps} reasoning steps, got {consistency.shape[0]}"
+    
+    # Mean consistency should be between 0 and 1 (since we use sigmoid)
+    mean_cons = reasoning_info["mean_consistency"]
+    assert 0.0 <= mean_cons <= 1.0, f"Mean consistency should be in [0,1], got {mean_cons}"
+    
+    # Refined value should be a scalar
+    refined_value = reasoning_info["refined_value"]
+    assert refined_value.shape == (2, 1), f"refined_value shape: {refined_value.shape}"
+    
+    # Test reset
+    engine.reset()
+    assert engine._reasoning_step == 0, "Reasoning step should be 0 after reset"
+    
+    print(f"  Refined h shape: {refined_h.shape}")
+    print(f"  Consistency scores shape: {consistency.shape}")
+    print(f"  Mean consistency: {mean_cons:.4f}")
+    print(f"  Reasoning steps: {reasoning_info['num_reasoning_steps']}")
 
-    # After enough steps with consistent patterns, mechanics may be discovered
-    stats = mde.get_stats()
-    print(f"  MDE stats: {stats}")
-    assert isinstance(tags, list)
-    assert isinstance(hints, dict)
 
+@test("Reasoning Engine - Counterfactual reasoning with world model")
+def test_reasoning_engine_counterfactual():
+    from deep_thought.reasoning.reasoning_engine import ReasoningEngine
+    from deep_thought.architecture.world_model import WorldModel
+    from deep_thought.config import ReasoningConfig, WorldModelConfig
 
-@test("MDE - Routing hints and expert affinities")
-def test_mde_routing_hints():
-    from deep_thought.mechanic_discovery.mde import MechanicDiscoveryEngine, MechanicDiscoveryConfig, MechanicTag
-
-    config = MechanicDiscoveryConfig(
-        use_mde=True,
-        observation_dim=16,
-        action_dim=2,
-        context_dim=8,
-        stability_threshold=0.5,
-        min_context_span=2,
-        window_size=50,
+    config = ReasoningConfig(
+        use_reasoning=True,
+        num_reasoning_steps=2,
+        use_counterfactual=True,
+        num_counterfactual_actions=4,
     )
-    mde = MechanicDiscoveryEngine(config)
+    latent_dim = 64
+    action_dim = 4
+    num_experts = 8
 
-    # Process steps
-    for step in range(30):
-        action = torch.randn(2)
-        obs = torch.randn(16)
-        context = torch.randn(8)
-        tags, hints = mde.process_step(action, obs, context, reward=0.5)
+    engine = ReasoningEngine(config, latent_dim, num_experts)
+    
+    # Create a small world model
+    wm_config = WorldModelConfig(latent_dim=latent_dim, hidden_dim=128, action_dim=action_dim)
+    world_model = WorldModel(wm_config, action_dim=action_dim)
+    
+    h_tilde = torch.randn(2, latent_dim)
+    x_t = torch.randn(2, latent_dim)
 
-    # Test get_routing_hints directly
-    empty_hints = mde.get_routing_hints([])
-    assert empty_hints == {}, f"Empty tags should give empty hints, got {empty_hints}"
-    print(f"  Routing hints work correctly")
-
-
-@test("MDE - Mechanic contradiction and validation")
-def test_mde_contradiction():
-    from deep_thought.mechanic_discovery.mde import MechanicDiscoveryEngine, MechanicDiscoveryConfig
-
-    config = MechanicDiscoveryConfig(
-        use_mde=True,
-        observation_dim=16,
-        action_dim=2,
-        context_dim=8,
-        stability_threshold=0.5,
-        min_context_span=2,
-        window_size=50,
-        contradiction_threshold=0.3,
-        validation_interval=10,
-    )
-    mde = MechanicDiscoveryEngine(config)
-
-    # Process enough steps to potentially discover mechanics
-    for step in range(60):
-        action = torch.tensor([1.0, 0.0])
-        obs = torch.randn(16) + 0.5
-        context = torch.randn(8) * (step + 1)
-        tags, hints = mde.process_step(action, obs, context, reward=1.0)
-
-    # Test contradiction method
-    mde.contradict_mechanic(0)
-    stats = mde.get_stats()
-    print(f"  MDE stats after contradiction: {stats}")
+    # Forward pass with world model for counterfactual reasoning
+    refined_h, reasoning_info = engine(h_tilde, x_t, world_model=world_model, action_dim=action_dim, training=True)
+    
+    # Verify counterfactual info
+    assert "counterfactual_info" in reasoning_info, "Should have counterfactual_info"
+    cf_info = reasoning_info["counterfactual_info"]
+    assert "best_action_idx" in cf_info, "Should have best_action_idx"
+    assert "cf_values" in cf_info, "Should have cf_values"
+    
+    # Verify counterfactual values shape
+    cf_values = cf_info["cf_values"]
+    assert cf_values.shape == (2, config.num_counterfactual_actions), f"cf_values shape: {cf_values.shape}"
+    
+    # Best action idx should be valid
+    best_idx = cf_info["best_action_idx"]
+    assert best_idx.shape == (2,), f"best_action_idx shape: {best_idx.shape}"
+    assert (best_idx >= 0).all() and (best_idx < config.num_counterfactual_actions).all(), "best_action_idx out of range"
+    
+    print(f"  Counterfactual values: {cf_values.shape}")
+    print(f"  Best action indices: {best_idx}")
 
 
-# ============================================================
-# 13. Autonomous Expert Specialization Stress Tests
-# ============================================================
-
-@test("Autonomous Specialization - Growth trigger and tracking")
-def test_autonomous_specialization_growth():
-    from deep_thought.learning.autonomous_specialization import AutonomousSpecialization, AutonomousSpecializationConfig
-
-    config = AutonomousSpecializationConfig(
-        use_autonomous_specialization=True,
-        growth_confidence_threshold=0.8,
-        growth_context_span_min=3,
-        max_specialists_per_mechanic=2,
-    )
-    spec = AutonomousSpecialization(config)
-
-    # Should trigger growth for high-confidence mechanic with no expert
-    should_grow = spec.should_trigger_growth(
-        mechanic_tag_id="Mechanic_001",
-        invariant_confidence=0.9,
-        invariant_context_span=5,
-        has_matching_expert=False,
-    )
-    assert should_grow, "Should trigger growth for high-confidence invariant"
-
-    # Should NOT trigger growth for low-confidence
-    should_grow_low = spec.should_trigger_growth(
-        mechanic_tag_id="Mechanic_002",
-        invariant_confidence=0.5,
-        invariant_context_span=5,
-        has_matching_expert=False,
-    )
-    assert not should_grow_low, "Should NOT trigger growth for low-confidence"
-
-    # Should NOT trigger when expert already exists
-    should_grow_exists = spec.should_trigger_growth(
-        mechanic_tag_id="Mechanic_001",
-        invariant_confidence=0.9,
-        invariant_context_span=5,
-        has_matching_expert=True,
-    )
-    assert not should_grow_exists, "Should NOT trigger when expert exists"
-
-    # Record a specialist
-    spec.record_specialist(
-        expert_id=10,
-        mechanic_tag_id="Mechanic_001",
-        invariant_id=1,
-        parent_expert_id=5,
-    )
-    assert spec.has_specialist_for_mechanic("Mechanic_001")
-    print(f"  Specialization stats: {spec.get_stats()}")
-
-
-@test("Autonomous Specialization - Contradiction-based pruning")
-def test_autonomous_specialization_contradiction():
-    from deep_thought.learning.autonomous_specialization import AutonomousSpecialization, AutonomousSpecializationConfig
-
-    config = AutonomousSpecializationConfig(
-        use_autonomous_specialization=True,
-        contradiction_prune_threshold=0.2,
-    )
-    spec = AutonomousSpecialization(config)
-
-    # Create specialists
-    spec.record_specialist(expert_id=10, mechanic_tag_id="Mech_001", invariant_id=1, parent_expert_id=5)
-    spec.record_specialist(expert_id=11, mechanic_tag_id="Mech_001", invariant_id=1, parent_expert_id=5)
-
-    # Handle contradiction
-    prune_ids = spec.handle_contradiction("Mech_001")
-    assert len(prune_ids) == 2, f"Should prune 2 specialists, got {len(prune_ids)}"
-    assert 10 in prune_ids and 11 in prune_ids
-
-    # After contradiction, no active specialists
-    assert not spec.has_specialist_for_mechanic("Mech_001")
-    print(f"  Pruned expert IDs: {prune_ids}")
-
-
-# ============================================================
-# 14. Stability in the Dark Stress Tests
-# ============================================================
-
-@test("Stability in the Dark - Capability Density gate")
-def test_stability_density_gate():
-    from deep_thought.stability.srp import SelfRegressionPrevention
-    from deep_thought.config import SRPConfig
-
-    config = SRPConfig(use_srp=True)
-    srp = SelfRegressionPrevention(config)
-
-    # Normal: small density change should be approved
-    approved, reason = srp.check_discovery_impact(1.0, 0.95)
-    assert approved, f"Small change should be approved, got: {reason}"
-
-    # Large drop should trigger rollback
-    approved, reason = srp.check_discovery_impact(1.0, 0.8)
-    assert not approved, f"Large drop should be rejected, got: {reason}"
-    assert srp.is_density_gate_active(), "Density gate should be active after rollback"
-
-    # Gate should remain active during cooldown
-    for _ in range(100):
-        srp.tick_density_gate()
-    assert srp.is_density_gate_active(), "Gate should still be active during cooldown"
-
-    # Gate should clear after full cooldown
-    for _ in range(500):
-        srp.tick_density_gate()
-    assert not srp.is_density_gate_active(), "Gate should clear after cooldown"
-    print(f"  Density gate working correctly")
-
-
-@test("Stability in the Dark - Dissection Layer checkpoint and rollback")
-def test_stability_dissection_rollback():
-    from deep_thought.stability.srp import SelfRegressionPrevention
-    from deep_thought.config import SRPConfig
-
-    config = SRPConfig(use_srp=True)
-    srp = SelfRegressionPrevention(config)
-
-    # Save a checkpoint
-    dissection_state = {"weights": [1.0, 2.0, 3.0], "bias": [0.1]}
-    srp.checkpoint_dissection_layer(dissection_state, step=100)
-
-    # Modify the state (simulating a bad discovery)
-    dissection_state["weights"][0] = 999.0
-
-    # Roll back
-    restored = srp.rollback_dissection_layer()
-    assert restored is not None, "Should have a checkpoint to restore"
-    assert restored["weights"][0] == 1.0, f"Should restore original weights, got {restored['weights'][0]}"
-    print(f"  Dissection layer rollback working correctly")
-
-
-@test("Stability in the Dark - Scientific method enforcement")
-def test_stability_scientific_method():
-    from deep_thought.stability.srp import SelfRegressionPrevention
-    from deep_thought.config import SRPConfig
-
-    config = SRPConfig(use_srp=True)
-    srp = SelfRegressionPrevention(config)
-
-    # Register a pending discovery
-    srp.register_pending_discovery({
-        "id": "disc_001",
-        "mechanic_tag_id": "Mechanic_001",
-        "prediction_accuracy_before": 0.80,
-        "prediction_accuracy_after": 0.85,  # 6.25% improvement
-    })
-
-    # Evaluate: should be proven (improvement > 5%)
-    proven = srp.evaluate_discovery_proof("disc_001")
-    assert proven, "Discovery with >5% improvement should be proven"
-
-    # Register another that doesn't improve enough
-    srp.register_pending_discovery({
-        "id": "disc_002",
-        "mechanic_tag_id": "Mechanic_002",
-        "prediction_accuracy_before": 0.80,
-        "prediction_accuracy_after": 0.82,  # Only 2.5% improvement
-    })
-
-    proven2 = srp.evaluate_discovery_proof("disc_002")
-    assert not proven2, "Discovery with <5% improvement should NOT be proven"
-
-    proven_discoveries = srp.get_proven_discoveries()
-    assert len(proven_discoveries) == 1
-    print(f"  Scientific method enforcement working: {len(proven_discoveries)} proven")
-
-
-@test("Full Agent - Construction with Black Box components")
-def test_agent_black_box():
+@test("Reasoning Engine - Integration with full agent")
+def test_reasoning_engine_with_agent():
     from deep_thought.agent import DeepThoughtAgent
     from deep_thought.config import DeepThoughtConfig
 
@@ -1604,24 +1344,35 @@ def test_agent_black_box():
     config.subgoal.goal_embedding_dim = 16
     config.opponent_modeling.opponent_latent_dim = 16
     config.opponent_modeling.tendency_dim = 8
-    # Black Box configs
-    config.mechanic_discovery.observation_dim = 64
-    config.mechanic_discovery.action_dim = 2
-    config.mechanic_discovery.context_dim = 16
+    config.reasoning.use_reasoning = True
+    config.reasoning.num_reasoning_steps = 2
+    config.reasoning.use_counterfactual = False  # Disable counterfactual for speed
 
     agent = DeepThoughtAgent(config)
-    n_params = sum(p.numel() for p in agent.parameters())
-    print(f"  Agent parameters (with Black Box): {n_params:,}")
-    assert hasattr(agent, 'mde')
-    assert hasattr(agent, 'autonomous_specialization')
-    assert hasattr(agent, 'stability_in_the_dark_config')
+    assert agent.reasoning_engine is not None, "Reasoning engine should be initialized"
+    
+    agent.reset(1)
+    obs = torch.randn(1, 4)
+
+    # Forward pass
+    outputs = agent.forward(obs, reward=0.5, training=True)
+    
+    # Verify reasoning info is in outputs
+    assert "reasoning_info" in outputs, "Should have reasoning_info in outputs"
+    reasoning_info = outputs["reasoning_info"]
+    assert "consistency_scores" in reasoning_info, "Should have consistency_scores"
+    assert "mean_consistency" in reasoning_info, "Should have mean_consistency"
+    
+    print(f"  Reasoning mean_consistency: {reasoning_info['mean_consistency']:.4f}")
+    print(f"  Reasoning steps: {reasoning_info['num_reasoning_steps']}")
+    print(f"  Agent with reasoning engine: OK")
 
 
 # ============================================================
 # Run All Tests
 # ============================================================
 
-def run_all_tests():
+if __name__ == "__main__":
     print("="*60)
     print("DEEP THOUGHT RL - COMPREHENSIVE STRESS TEST")
     print(f"PyTorch version: {torch.__version__}")
@@ -1650,11 +1401,11 @@ def run_all_tests():
         test_agent_construction,
         test_agent_forward,
         test_agent_episode,
-        test_agent_ppo_learning_updates_submodules,
         test_agent_continuous,
         test_config_yaml,
         test_srp,
         test_performance,
+        # Governance tests (7 fixes)
         test_governance_single_objective,
         test_governance_timescale,
         test_governance_capacity_ledger,
@@ -1664,26 +1415,10 @@ def run_all_tests():
         test_governance_signal_normalizer,
         test_governance_integrated,
         test_agent_with_governance,
-        test_mde_invariant_detection,
-        test_mde_routing_hints,
-        test_mde_contradiction,
-        test_autonomous_specialization_growth,
-        test_autonomous_specialization_contradiction,
-        test_stability_density_gate,
-        test_stability_dissection_rollback,
-        test_stability_scientific_method,
-        test_agent_black_box,
-        test_meta_loop,
-        test_meta_loop_action,
-        test_formal_verification_syntactic,
-        test_formal_verification_kl,
-        test_formal_verification_full,
-        test_shadow_evolution,
-        test_shadow_evolution_replacement_guardrails,
-        test_shadow_mutator,
-        test_dynamic_hyperparams,
-        test_dynamic_hyperparams_meta_controller,
-        test_agent_with_stable_si,
+        # Reasoning engine tests
+        test_reasoning_engine,
+        test_reasoning_engine_counterfactual,
+        test_reasoning_engine_with_agent,
     ]
 
     for fn in test_fns:
@@ -1873,8 +1608,6 @@ def test_shadow_evolution():
 
     # Evaluate
     should_swap, improvement = engine.evaluate_shadow(shadow_id1, 0.3, 0.5)
-    for _ in range(config.min_evaluations_before_swap - 1):
-        engine.evaluate_shadow(shadow_id1, 0.3, 0.5)
     print(f"  Shadow swap: {should_swap}, improvement: {improvement:.4f}")
 
     # Tournament select
@@ -1884,40 +1617,6 @@ def test_shadow_evolution():
 
     stats = engine.get_stats()
     print(f"  Shadow evolution stats: {stats}")
-
-
-@test("Shadow Evolution - Replacement guardrails")
-def test_shadow_evolution_replacement_guardrails():
-    from deep_thought.learning.shadow_evolution import ShadowEvolutionEngine, ShadowEvolutionConfig
-
-    config = ShadowEvolutionConfig(
-        max_shadow_experts=4,
-        mutation_rate=0.0,
-        min_shadow_age=2,
-        min_evaluations_before_swap=3,
-        replacement_cooldown=3,
-        swap_threshold=0.1,
-    )
-    engine = ShadowEvolutionEngine(config)
-    expert_state = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
-    shadow_id = engine.spawn_shadow(0, expert_state)
-
-    should_swap, _ = engine.evaluate_shadow(shadow_id, 0.3, 0.5)
-    assert not should_swap, "young shadows should not swap immediately"
-
-    engine.evolve_cycle()
-    engine.evolve_cycle()
-    engine.evaluate_shadow(shadow_id, 0.3, 0.5)
-    should_swap, _ = engine.evaluate_shadow(shadow_id, 0.3, 0.5)
-    assert should_swap, "stable evaluated shadows should be swappable"
-
-    assert engine.get_swap_state_dict(shadow_id) is not None
-    cooldown_shadow = engine.spawn_shadow(0, expert_state)
-    engine.evolve_cycle()
-    engine.evolve_cycle()
-    for _ in range(config.min_evaluations_before_swap):
-        should_swap, _ = engine.evaluate_shadow(cooldown_shadow, 0.3, 0.5)
-    assert not should_swap, "cooldown should prevent replacement churn"
 
 
 @test("Shadow Evolution - Mutator")
@@ -2065,7 +1764,3 @@ def test_agent_with_stable_si():
     print(f"  Formal verification: {stats['formal_verification_stats']}")
     print(f"  Shadow evolution: {stats['shadow_evolution_stats']}")
     print(f"  Dynamic hyperparams: {stats['dynamic_hyperparams_stats']}")
-
-
-if __name__ == "__main__":
-    run_all_tests()

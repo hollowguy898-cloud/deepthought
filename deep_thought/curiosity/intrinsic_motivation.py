@@ -172,7 +172,7 @@ class NoveltyBonus(nn.Module):
     def __init__(
         self,
         latent_dim: int = 64,
-        hash_size: int = 1000000,
+        hash_size: int = 10000,
         num_projections: int = 32,
     ):
         super().__init__()
@@ -215,20 +215,14 @@ class NoveltyBonus(nn.Module):
 
         projected = self.projection(latent)  # (batch, num_projections)
         # Sign-based binary hash: each dimension contributes one bit
-        binary_code = (projected > 0).long()  # (batch, num_projections)
+        binary_code = (projected > 0).float()  # (batch, num_projections)
         # Convert binary code to integer via positional weighting
-        # Use integer arithmetic to avoid float32 precision loss
-        # (float32 can only exactly represent integers up to 2^24,
-        #  so summing 2^i for i=0..31 in float32 collapses codes)
-        powers = 1 << torch.arange(
-            self.num_projections, device=latent.device, dtype=torch.long
+        powers = 2.0 ** torch.arange(
+            self.num_projections, device=latent.device, dtype=torch.float32
         )
-        int_code = (binary_code * powers).sum(dim=-1)  # (batch,) long
-        # Multiplicative hash (Knuth) for better distribution before modulo
-        # Multiplying by the golden-ratio-derived prime spreads codes
-        # more uniformly across the hash table, reducing collision rate.
-        LARGE_PRIME = 2654435761  # 2^32 * (sqrt(5)-1)/2
-        hash_indices = ((int_code * LARGE_PRIME) & 0x7FFFFFFF) % self.hash_size
+        int_code = (binary_code * powers).sum(dim=-1)  # (batch,)
+        # Map to hash-table range
+        hash_indices = int_code.long() % self.hash_size
         return hash_indices
 
     def update_visit_counts(self, latent: torch.Tensor) -> None:

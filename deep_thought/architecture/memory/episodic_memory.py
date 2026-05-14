@@ -215,8 +215,9 @@ class EpisodicMemory(nn.Module):
         entries = [self.buffer[i] for i in top_k_indices]
         
         # Compute attention weights
-        similarities_k = [similarities[i] for i in top_k_indices]
-        attention = F.softmax(torch.tensor(similarities_k, dtype=torch.float32), dim=0)
+        # Clamp negative similarities (cosine similarity can be negative for anti-correlated vectors)
+        similarities_k = [max(0.0, similarities[i]) for i in top_k_indices]
+        attention = F.softmax(torch.tensor(similarities_k, dtype=torch.float32, device=query.device), dim=0)
         
         # Aggregate values
         values = torch.stack([entry.value for entry in entries])
@@ -270,10 +271,10 @@ class EpisodicMemory(nn.Module):
         ]
         
         for entry in candidates:
-            # Add to semantic memory - unsqueeze to add batch dim
-            value_input = entry.value.unsqueeze(0) if entry.value.dim() == 1 else entry.value
+            # Add to semantic memory - use observation as both latent and observation inputs
+            # since semantic_memory.write() expects latent_dim for its concept_encoder
             obs_input = entry.observation.unsqueeze(0) if entry.observation.dim() == 1 else entry.observation
-            semantic_memory.write(value_input, obs_input)
+            semantic_memory.write(obs_input, obs_input)
         
         # Remove consolidated entries
         self.buffer = [

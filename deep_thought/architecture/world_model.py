@@ -120,16 +120,22 @@ class WorldModel(nn.Module):
         return self.observation_decoder(z)
 
     def set_observation_dim(self, obs_dim: int):
-        """Set observation dimension and initialize decoder."""
+        """Set observation dimension and initialize decoder.
+        
+        BUG 4 fix: Register observation_decoder as a proper submodule
+        instead of using .to(device). Since it's assigned as
+        self.observation_decoder, it becomes a submodule and will be
+        moved with the model via .to(device), avoiding the bug where
+        the decoder stays on CPU when the model is moved to GPU.
+        """
         if self._obs_dim == obs_dim and self.observation_decoder is not None:
             return
         self._obs_dim = obs_dim
-        device = next(self.parameters()).device
         self.observation_decoder = nn.Sequential(
             nn.Linear(self.latent_dim, self.config.hidden_dim),
             nn.SiLU(),
             nn.Linear(self.config.hidden_dim, obs_dim),
-        ).to(device)
+        )
     
     def imagine_rollout(
         self,
@@ -179,9 +185,7 @@ class WorldModel(nn.Module):
             
             # Update
             z_t = z_next
-            # Correct probabilistic accumulation: P(done by t) = 1 - (1 - P(done by t-1)) * (1 - P(done at t))
-            if d_pred is not None:
-                done = 1.0 - (1.0 - done) * (1.0 - d_pred)
+            done = done + d_pred if d_pred is not None else done
             done = done.clamp(max=1.0)
         
         z_seq = torch.stack(z_seq, dim=1)  # [B, T+1, D]

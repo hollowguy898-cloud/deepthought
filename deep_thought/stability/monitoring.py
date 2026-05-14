@@ -74,23 +74,22 @@ class PerformanceMonitor:
         if expert_utilities is not None:
             self.expert_utilities = expert_utilities
     
-    def compute_drift(self) -> Optional[float]:
+    def compute_drift(self) -> float:
         """
         Compute performance drift.
         
         Returns:
-            drift: Performance drift (negative = regression), or None
-                if the buffer is too small for a meaningful comparison.
+            drift: Performance drift (negative = regression)
         """
-        # Need at least 200 entries so that the recent window (last 100)
-        # and the historical window (everything before) do not overlap.
-        min_buffer_for_drift = 200
-        if len(self.rewards) < min_buffer_for_drift:
-            return None
+        if len(self.rewards) < 2:
+            return 0.0
         
-        # Compare recent to historical (non-overlapping windows)
+        # Compare recent to historical
         recent = list(self.rewards)[-100:]
-        historical = list(self.rewards)[:-100]
+        historical = list(self.rewards)[:-100] if len(self.rewards) > 100 else list(self.rewards)
+        
+        if len(historical) == 0:
+            return 0.0
         
         recent_mean = sum(recent) / len(recent)
         historical_mean = sum(historical) / len(historical)
@@ -108,12 +107,9 @@ class PerformanceMonitor:
             threshold: Drift threshold
             
         Returns:
-            is_regressing: Whether performance is regressing.
-                Returns False if drift cannot be computed (buffer too small).
+            is_regressing: Whether performance is regressing
         """
         drift = self.compute_drift()
-        if drift is None:
-            return False
         return drift < -threshold
     
     def get_short_term_performance(self) -> float:
@@ -150,7 +146,7 @@ class PerformanceMonitor:
         return {
             "reward_ema": self.reward_ema,
             "loss_ema": self.loss_ema,
-            "drift": self.compute_drift() or 0.0,
+            "drift": self.compute_drift(),
             "is_regressing": self.check_regression(),
             "short_term_perf": self.get_short_term_performance(),
             "long_term_perf": self.get_long_term_performance(),

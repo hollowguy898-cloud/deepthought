@@ -28,7 +28,7 @@ class CosineAnnealingWarmupScheduler(_LRScheduler):
         super().__init__(optimizer, last_epoch)
     
     def get_lr(self):
-        if self.warmup_steps > 0 and self.last_epoch < self.warmup_steps:
+        if self.last_epoch < self.warmup_steps:
             # Linear warmup
             return [
                 base_lr * self.last_epoch / self.warmup_steps
@@ -63,7 +63,7 @@ class ExponentialDecayScheduler(_LRScheduler):
         super().__init__(optimizer, last_epoch)
     
     def get_lr(self):
-        if self.warmup_steps > 0 and self.last_epoch < self.warmup_steps:
+        if self.last_epoch < self.warmup_steps:
             # Linear warmup
             return [
                 base_lr * self.last_epoch / self.warmup_steps

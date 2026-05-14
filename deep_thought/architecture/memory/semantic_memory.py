@@ -67,13 +67,12 @@ class SemanticMemory(nn.Module):
             latent: Latent representation
             observation: Observation
         """
-        # Encode to concept — allow gradient flow so the concept encoder
-        # can improve from consolidation signals (removing torch.no_grad()
-        # that previously prevented the encoder from learning).
-        embedding = self.concept_encoder(latent)
-        # Handle batch dimension - take first element
-        if embedding.dim() > 1:
-            embedding = embedding[0]
+        # Encode to concept
+        with torch.no_grad():
+            embedding = self.concept_encoder(latent)
+            # Handle batch dimension - take first element
+            if embedding.dim() > 1:
+                embedding = embedding[0]
         
         # Check for similar existing concept
         similar_idx = self._find_similar(embedding)
@@ -88,7 +87,7 @@ class SemanticMemory(nn.Module):
         else:
             # Create new concept
             with torch.no_grad():
-                prototype = latent.detach().clone()
+                prototype = latent.detach()
                 if prototype.dim() > 1:
                     prototype = prototype[0]
             
@@ -165,7 +164,7 @@ class SemanticMemory(nn.Module):
         # Weight by strength
         similarities_k = [similarities[i] for i in top_k_indices]
         strengths = [retrieved[i].strength for i in range(len(retrieved))]
-        weights = torch.tensor(similarities_k, dtype=torch.float32) * torch.tensor(strengths, dtype=torch.float32)
+        weights = torch.tensor(similarities_k, dtype=torch.float32, device=query.device) * torch.tensor(strengths, dtype=torch.float32, device=query.device)
         weights = F.softmax(weights, dim=0)
         
         # Aggregate prototypes

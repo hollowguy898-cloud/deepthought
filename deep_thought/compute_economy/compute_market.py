@@ -308,15 +308,6 @@ class ComputeAuction:
                 )
                 new_allocations[bid.expert_id] = actual_amount
                 energy_remaining -= actual_amount * effective_price
-            # Clamp total allocation to energy budget
-            # (Vickrey's lower effective prices can cause total raw
-            # allocation to exceed the budget even though cost fits)
-            total_allocated = sum(new_allocations.values())
-            if total_allocated > energy_budget:
-                scale = energy_budget / (total_allocated + 1e-8)
-                new_allocations = {
-                    eid: amt * scale for eid, amt in new_allocations.items()
-                }
             allocations = new_allocations
 
         return allocations, winning_bids, losing_bids, clearing_price
@@ -423,8 +414,7 @@ class BudgetAllocator(nn.Module):
                 ``energy_budget``.
         """
         budgets = torch.full(
-            (self.num_experts,), self.min_allocation, dtype=torch.float32,
-            device=self.sharpness.device,
+            (self.num_experts,), self.min_allocation, dtype=torch.float32
         )
 
         total_raw = sum(raw_allocations.values()) + self.num_experts * self.min_allocation

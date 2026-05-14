@@ -87,7 +87,6 @@ class VolatilityDetector:
     """
 
     def __init__(self, config: DynamicHyperparamsConfig):
-        super().__init__()
         self.config = config
         self._grad_norm_history: deque = deque(maxlen=config.volatility_window)
         self._loss_history: deque = deque(maxlen=config.volatility_window)
@@ -149,9 +148,7 @@ class VolatilityDetector:
             return False
 
         history = list(self._prediction_error_history)
-        # Use a rolling window: the 10 entries just before the most recent 10
-        # as baseline, rather than the very first 10 entries which become stale.
-        baseline = sum(history[-20:-10]) / 10.0 if len(history) >= 20 else sum(history[:len(history)//2]) / max(1, len(history)//2)
+        baseline = sum(history[:10]) / 10.0
         recent = sum(history[-10:]) / 10.0
 
         if baseline < 1e-10:
@@ -220,7 +217,7 @@ class MetaController(nn.Module):
         )
 
         # Entropy coefficient (positive, bounded)
-        entropy_coef = F.softplus(self.entropy_head(h)) * 0.1
+        entropy_coef = torch.abs(self.entropy_head(h)) * 0.1
 
         # Exploration bonus (positive, bounded)
         explore_bonus = torch.sigmoid(self.explore_head(h)) * 0.5
@@ -261,7 +258,7 @@ class MetaController(nn.Module):
         return state
 
 
-class DynamicHyperparamController(nn.Module):
+class DynamicHyperparamController:
     """Top-level controller for dynamic hyperparameter adaptation.
 
     Orchestrates:
@@ -281,7 +278,6 @@ class DynamicHyperparamController(nn.Module):
     """
 
     def __init__(self, config: DynamicHyperparamsConfig):
-        super().__init__()
         self.config = config
         self.volatility = VolatilityDetector(config)
         self.meta_controller = MetaController(config)
@@ -358,7 +354,7 @@ class DynamicHyperparamController(nn.Module):
         if self._in_warmup:
             # Warmup phase: use elevated learning rate, freeze architecture
             return {
-                "learning_rate": min(self._current_lr * self.config.warmup_lr_multiplier, self.config.lr_max),
+                "learning_rate": self._current_lr * self.config.warmup_lr_multiplier,
                 "pruning_threshold": self.config.pruning_threshold_max,
                 "entropy_coef": self._current_entropy_coef * 2.0,
                 "exploration_bonus": 0.5,
