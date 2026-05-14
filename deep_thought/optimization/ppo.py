@@ -26,8 +26,10 @@ class RolloutBuffer:
         self.latents = []
         self.next_latents = []
         self.memory_reads = []
+        self.hidden_states = []
         self.selected_indices = []
         self.gates = []
+        self.contexts = []
     
     def add(
         self,
@@ -40,8 +42,10 @@ class RolloutBuffer:
         latent,
         next_latent,
         memory_read,
+        hidden_state,
         selected_indices,
-        gates
+        gates,
+        context=None,
     ):
         """Add a timestep to buffer."""
         self.observations.append(observation.detach())
@@ -57,8 +61,11 @@ class RolloutBuffer:
         self.latents.append(latent.detach())
         self.next_latents.append(next_latent.detach())
         self.memory_reads.append(memory_read.detach())
+        self.hidden_states.append(hidden_state.detach())
         self.selected_indices.append(selected_indices.detach())
         self.gates.append(gates.detach())
+        if context is not None:
+            self.contexts.append(context.detach())
     
     def clear(self):
         """Clear buffer."""
@@ -71,8 +78,10 @@ class RolloutBuffer:
         self.latents = []
         self.next_latents = []
         self.memory_reads = []
+        self.hidden_states = []
         self.selected_indices = []
         self.gates = []
+        self.contexts = []
     
     def get_batch(self) -> Dict:
         """Get batch as dictionary."""
@@ -81,8 +90,10 @@ class RolloutBuffer:
         latents = torch.stack(self.latents)
         next_latents = torch.stack(self.next_latents)
         memory_reads = torch.stack(self.memory_reads)
+        hidden_states = torch.stack(self.hidden_states)
         selected_indices = torch.stack(self.selected_indices)
         gates = torch.stack(self.gates)
+        contexts = torch.stack(self.contexts) if self.contexts else None
 
         # Squeeze out extra dimensions from single-step unsqueeze(0) during rollout
         # obs: (T, 1, ...) -> (T, ...), actions: (T, 1) -> (T,)
@@ -96,10 +107,14 @@ class RolloutBuffer:
             next_latents = next_latents.squeeze(1)
         if memory_reads.dim() == 3 and memory_reads.size(1) == 1:
             memory_reads = memory_reads.squeeze(1)
+        if hidden_states.dim() == 3 and hidden_states.size(1) == 1:
+            hidden_states = hidden_states.squeeze(1)
         if selected_indices.dim() == 3 and selected_indices.size(1) == 1:
             selected_indices = selected_indices.squeeze(1)
         if gates.dim() == 3 and gates.size(1) == 1:
             gates = gates.squeeze(1)
+        if contexts is not None and contexts.dim() == 3 and contexts.size(1) == 1:
+            contexts = contexts.squeeze(1)
 
         log_probs = torch.stack(self.log_probs)
         if log_probs.dim() == 2 and log_probs.size(-1) == 1:
@@ -115,8 +130,10 @@ class RolloutBuffer:
             "latents": latents,
             "next_latents": next_latents,
             "memory_reads": memory_reads,
+            "hidden_states": hidden_states,
             "selected_indices": selected_indices,
             "gates": gates,
+            "contexts": contexts,
         }
     
     def __len__(self):
@@ -273,13 +290,18 @@ class PPOTrainer:
                     torch.zeros_like(outputs["latent"])
                 ),
                 outputs.get(
+                    "hidden_state",
+                    torch.zeros_like(outputs["latent"])
+                ),
+                outputs.get(
                     "selected_indices",
                     torch.zeros(action.size(0), 1, dtype=torch.long, device=device)
                 ),
                 outputs.get(
                     "gates",
                     torch.ones(action.size(0), 1, device=device)
-                )
+                ),
+                outputs.get("context"),
             )
             
             total_reward += reward
@@ -396,6 +418,11 @@ class PPOTrainer:
                 mb_returns = returns[mb_indices]
                 mb_latents = batch["latents"][mb_indices]
                 mb_next_latents = batch["next_latents"][mb_indices]
+                mb_hidden_states = batch["hidden_states"][mb_indices]
+                mb_memory_reads = batch["memory_reads"][mb_indices]
+                mb_context = None
+                if batch["contexts"] is not None:
+                    mb_context = batch["contexts"][mb_indices]
                 
                 # Forward pass through FULL agent pipeline for gradient flow.
                 # We use a stateless forward pass that goes through encoder →
@@ -408,14 +435,19 @@ class PPOTrainer:
                 # Step 1: Encode observations (gradient flows through encoder)
                 latent, _ = self.model.encoder(mb_obs)
 
-                # Step 2: Route through router and experts using latent
+                # Step 2: Route through router and experts using rollout state
                 mb_batch_size = mb_obs.size(0)
                 mb_device = mb_obs.device
-                mb_h_t = torch.zeros(mb_batch_size, self.model.config.encoder.latent_dim, device=mb_device)
-                mb_m_t = torch.zeros(mb_batch_size, self.model.config.encoder.latent_dim, device=mb_device)
-                mb_context = None
-                if self.model.meta_learning is not None:
-                    mb_context = torch.zeros(mb_batch_size, self.model.config.meta_learning.context_dim, device=mb_device)
+                mb_h_t = mb_hidden_states.to(mb_device)
+                mb_m_t = mb_memory_reads.to(mb_device)
+                if mb_context is not None:
+                    mb_context = mb_context.to(mb_device)
+                elif self.model.meta_learning is not None:
+                    mb_context = torch.zeros(
+                        mb_batch_size,
+                        self.model.config.meta_learning.context_dim,
+                        device=mb_device,
+                    )
 
                 # Router (gradient flows through router weights)
                 gates, selected_indices, router_info = self.model.router(

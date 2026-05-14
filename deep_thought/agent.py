@@ -465,6 +465,7 @@ class DeepThoughtAgent(nn.Module):
             write=(training and write_approved)
         )
         self.h_t = h_t
+        outputs["hidden_state"] = self.h_t
         # Update m_t with the actual memory read so routing uses real memory
         self.m_t = memory_info["memory_read"]
         outputs["memory_info"] = memory_info
@@ -519,6 +520,7 @@ class DeepThoughtAgent(nn.Module):
         # Update context
         if self.meta_learning is not None and self.context is not None:
             self.context = self.meta_learning.update_context(x_t)
+            outputs["context"] = self.context
 
         # --- Opponent Modeling ---
         opponent_context = None
