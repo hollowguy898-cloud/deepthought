@@ -131,8 +131,9 @@ class PPOTrainer:
     
     def __init__(self, config: TrainingConfig, model: nn.Module,
                  action_space: str = "discrete", action_dim: int = 2,
-                 intrinsic_reward_coef: float = 0.01,
-                 subgoal_reward_coef: float = 0.01):
+                 intrinsic_reward_coef: float = 0.1,   # FIX: 10x increase — 0.01 was too weak, curiosity had no effect
+                 subgoal_reward_coef: float = 0.1     # FIX: 10x increase — 0.01 was too weak, subgoals had no effect
+                 ):
         self.config = config
         self.model = model
         self.action_space = action_space
@@ -515,14 +516,26 @@ class PPOTrainer:
                     entropy_mean=entropy_mean
                 )
                 
-                # Auxiliary losses (world model, router, compute penalty)
+                # ============================================================
+                # AUXILIARY LOSSES: Ensure ALL modules receive gradient signal
+                #
+                # Previously only encoder->router->experts->policy_head received
+                # gradients during PPO updates. This caused routing collapse:
+                # world_model, curiosity, meta_loop, subgoal_generator,
+                # feature_validator, and reasoning_engine were effectively
+                # dead weights with zero gradient signal.
+                #
+                # Now we add auxiliary self-supervised losses for each module
+                # so they all participate in the gradient graph.
+                # ============================================================
                 aux_loss = torch.tensor(0.0, device=mb_device)
+                z_pred = None  # Track for downstream auxiliary losses
+                pred_error = None
+
+                # --- AUX 1: World Model ---
+                total_world_model_loss = 0.0
                 if getattr(self.model.config.world_model, "use_world_model", True):
                     wm_actions = self._world_model_actions(mb_actions, mb_device)
-                    # BUG FIX: Remove .detach() from mb_latents so the world model
-                    # receives gradient signal through the encoder. This was the #2
-                    # learning bug — the world model was completely disconnected from
-                    # the gradient graph, so it could never learn to predict next states.
                     z_pred, reward_pred, done_pred = self.model.world_model(
                         mb_latents,
                         wm_actions.detach()
@@ -541,14 +554,166 @@ class PPOTrainer:
                     )
                     aux_loss = aux_loss + wm_losses["total_loss"]
                     total_world_model_loss = wm_losses["total_loss"].item()
-                else:
-                    total_world_model_loss = 0.0
 
+                    # Compute prediction error for downstream modules
+                    pred_error = (z_pred - mb_latents).pow(2)  # (batch, latent_dim)
+
+                # --- AUX 2: Curiosity Self-Supervised Loss ---
+                # Train curiosity sub-modules to predict prediction error magnitude.
+                # Without this, curiosity parameters never receive gradients because
+                # the intrinsic_reward only flows through the policy gradient, which
+                # is too indirect to train the curiosity networks themselves.
+                total_curiosity_loss = 0.0
+                if self.model.curiosity is not None:
+                    try:
+                        if pred_error is None:
+                            pred_error = torch.zeros_like(mb_latents)
+
+                        embedded_latent = self.model.curiosity_proj(latent)
+                        pred_error_proj = self.model.curiosity_proj(pred_error.detach())
+
+                        intrinsic_reward, curiosity_info = self.model.curiosity(
+                            latent=embedded_latent,
+                            prediction_error=pred_error_proj,
+                            ensemble_uncertainty=None,
+                        )
+
+                        # Self-supervised target: curiosity should predict
+                        # the magnitude of prediction error
+                        curiosity_target = pred_error.mean(dim=-1).detach()
+                        curiosity_loss = F.mse_loss(intrinsic_reward, curiosity_target)
+                        aux_loss = aux_loss + 0.01 * curiosity_loss
+                        total_curiosity_loss = curiosity_loss.item()
+                    except Exception:
+                        total_curiosity_loss = 0.0
+
+                # --- AUX 3: Subgoal Generator Evaluator Loss ---
+                # Train subgoal evaluator to predict actual returns.
+                # Without this, the proposer/evaluator/decomposer networks
+                # never receive gradient signal and remain dead weights.
+                total_subgoal_loss = 0.0
+                if self.model.subgoal_generator is not None:
+                    try:
+                        reward_tensor = batch["rewards"][mb_indices].to(mb_device)
+                        if pred_error is not None:
+                            uncertainty_tensor = pred_error.mean(dim=-1).detach()
+                        else:
+                            uncertainty_tensor = torch.zeros(mb_batch_size, device=mb_device)
+                        progress_tensor = torch.ones(mb_batch_size, device=mb_device) * 0.5
+
+                        active_subgoal, subgoal_info = self.model.subgoal_generator(
+                            h_t=mb_h_t, x_t=latent,
+                            reward=reward_tensor.mean().detach(),
+                            uncertainty=uncertainty_tensor.mean().detach(),
+                            episode_progress=progress_tensor.mean().detach(),
+                        )
+
+                        if active_subgoal is not None:
+                            # Train evaluator: subgoal value should predict actual returns
+                            state_emb = self.model.subgoal_generator.encoder(
+                                mb_h_t, latent, reward_tensor.mean().detach(),
+                                uncertainty_tensor.mean().detach(), progress_tensor.mean().detach()
+                            )
+                            subgoal_vec = active_subgoal.goal_vector.to(mb_device)
+                            if subgoal_vec.dim() == 1:
+                                subgoal_vec = subgoal_vec.unsqueeze(0).expand(mb_batch_size, -1)
+                            sg_value = self.model.subgoal_generator.evaluator(state_emb, subgoal_vec)
+                            sg_loss = F.mse_loss(sg_value.squeeze(), mb_returns.detach())
+                            aux_loss = aux_loss + 0.01 * sg_loss
+                            total_subgoal_loss = sg_loss.item()
+                    except Exception:
+                        total_subgoal_loss = 0.0
+
+                # --- AUX 4: Meta-Loop Training Loss ---
+                # Train the meta-action network with capability density as reward.
+                # Without this, the meta-loop's action_net parameters never receive
+                # gradients and the meta-loop is purely observational.
+                total_meta_loop_loss = 0.0
+                if self.model.meta_loop is not None:
+                    try:
+                        density = self.model.expert_bank.capability_density()
+                        active_experts = self.model.expert_bank.get_active_experts()
+                        routing_entropy = router_info.get("entropy", None)
+                        mean_utility = (
+                            sum(s.utility_score for s in self.model.expert_bank.expert_stats.values())
+                            / max(1, len(self.model.expert_bank.expert_stats))
+                        )
+                        meta_obs = self.model.meta_loop.observe(
+                            density=density,
+                            num_active_experts=len(active_experts),
+                            max_experts=self.model.expert_bank.max_experts,
+                            routing_entropy=routing_entropy.item() if routing_entropy is not None else 1.0,
+                            mean_utility=mean_utility,
+                        )
+
+                        meta_state = meta_obs.get("meta_state")
+                        if meta_state is not None:
+                            action_probs_ml, meta_value, _ = self.model.meta_loop.action_net(meta_state)
+                            # Meta-target: predict current capability density
+                            meta_target = torch.tensor([density], device=mb_device)
+                            meta_loss = F.mse_loss(meta_value.squeeze(), meta_target)
+                            aux_loss = aux_loss + 0.001 * meta_loss
+                            total_meta_loop_loss = meta_loss.item()
+                    except Exception:
+                        total_meta_loop_loss = 0.0
+
+                # --- AUX 5: Reasoning Engine Consistency Loss ---
+                # Train consistency head and value refiner.
+                total_reasoning_loss = 0.0
+                if self.model.reasoning_engine is not None:
+                    try:
+                        # Re-run reasoning on current batch for gradient signal
+                        _, reas_info = self.model.reasoning_engine(
+                            h_tilde, latent,
+                            world_model=self.model.world_model if self.model.config.reasoning.use_counterfactual else None,
+                            action_dim=self.model.config.action_dim,
+                            training=True
+                        )
+                        if 'consistency_scores' in reas_info:
+                            consistency_target = mb_advantages.detach().abs()
+                            consistency_pred = reas_info['consistency_scores'].squeeze(-1)
+                            if consistency_pred.dim() > 1:
+                                consistency_pred = consistency_pred[-1]
+                            reasoning_consistency_loss = F.mse_loss(
+                                torch.sigmoid(consistency_pred),
+                                consistency_target.clamp(0, 1)
+                            )
+                            aux_loss = aux_loss + 0.01 * reasoning_consistency_loss
+
+                        if 'refined_value' in reas_info:
+                            rv_loss = F.mse_loss(reas_info['refined_value'].squeeze(), mb_returns.detach())
+                            aux_loss = aux_loss + 0.01 * rv_loss
+
+                        total_reasoning_loss += aux_loss.item()
+                    except Exception:
+                        total_reasoning_loss = 0.0
+
+                # --- Router losses: Load balance + Entropy ---
                 if "entropy" in router_info:
                     router_losses = self.model.router.compute_losses(router_info)
                     for router_loss in router_losses.values():
                         aux_loss = aux_loss + router_loss
 
+                # --- Stronger load balancing via coefficient of variation ---
+                # Penalize uneven expert usage to prevent routing collapse
+                try:
+                    inner_router = self.model.router.router
+                    if hasattr(inner_router, 'base_router'):
+                        expert_usage = inner_router.base_router.expert_usage
+                    elif hasattr(inner_router, 'expert_usage'):
+                        expert_usage = inner_router.expert_usage
+                    else:
+                        expert_usage = None
+
+                    if expert_usage is not None:
+                        usage_mean = expert_usage.mean()
+                        usage_std = expert_usage.std()
+                        cv = usage_std / (usage_mean + 1e-8)
+                        aux_loss = aux_loss + 0.1 * cv
+                except Exception:
+                    pass
+
+                # --- Compute penalty ---
                 from deep_thought.optimization.losses import compute_compute_penalty
                 aux_loss = aux_loss + compute_compute_penalty(
                     compute_costs,
@@ -599,6 +764,11 @@ class PPOTrainer:
                 metrics[f"epoch_{epoch}_value_loss"] = total_value_loss / num_updates
                 metrics[f"epoch_{epoch}_entropy"] = total_entropy / num_updates
                 metrics[f"epoch_{epoch}_kl"] = total_kl / num_updates
+                metrics[f"epoch_{epoch}_world_model_loss"] = total_world_model_loss / num_updates
+                metrics[f"epoch_{epoch}_curiosity_loss"] = total_curiosity_loss / num_updates
+                metrics[f"epoch_{epoch}_subgoal_loss"] = total_subgoal_loss / num_updates
+                metrics[f"epoch_{epoch}_meta_loop_loss"] = total_meta_loop_loss / num_updates
+                metrics[f"epoch_{epoch}_reasoning_loss"] = total_reasoning_loss / num_updates
         
         # Add aggregate metrics for easy access
         if any("policy_loss" in k for k in metrics):
@@ -607,6 +777,21 @@ class PPOTrainer:
         if any("value_loss" in k for k in metrics):
             value_losses = [v for k, v in metrics.items() if "value_loss" in k]
             metrics["value_loss"] = sum(value_losses) / len(value_losses)
+        if any("world_model_loss" in k for k in metrics):
+            wm_losses = [v for k, v in metrics.items() if "world_model_loss" in k]
+            metrics["world_model_loss"] = sum(wm_losses) / len(wm_losses)
+        if any("curiosity_loss" in k for k in metrics):
+            cur_losses = [v for k, v in metrics.items() if "curiosity_loss" in k]
+            metrics["curiosity_loss"] = sum(cur_losses) / len(cur_losses)
+        if any("subgoal_loss" in k for k in metrics):
+            sg_losses = [v for k, v in metrics.items() if "subgoal_loss" in k]
+            metrics["subgoal_loss"] = sum(sg_losses) / len(sg_losses)
+        if any("meta_loop_loss" in k for k in metrics):
+            ml_losses = [v for k, v in metrics.items() if "meta_loop_loss" in k]
+            metrics["meta_loop_loss"] = sum(ml_losses) / len(ml_losses)
+        if any("reasoning_loss" in k for k in metrics):
+            r_losses = [v for k, v in metrics.items() if "reasoning_loss" in k]
+            metrics["reasoning_loss"] = sum(r_losses) / len(r_losses)
         metrics["total_loss"] = metrics.get("policy_loss", 0.0) + metrics.get("value_loss", 0.0)
         
         # ---------------------------------------------------------------

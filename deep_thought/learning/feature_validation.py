@@ -102,17 +102,19 @@ class FeatureValidationEngine(nn.Module):
     ) -> List[int]:
         """
         Extract candidate features from latent activations.
-        
+
         Args:
             latent: Latent representation
             gradient_norms: Gradient norms per dimension
-            
+
         Returns:
             List of extracted feature IDs
         """
-        # Extract features via clustering
-        with torch.no_grad():
-            features = self.extractor(latent)
+        # FIX: Remove torch.no_grad() so the feature extractor receives
+        # gradient signal during training. Previously, the extractor was
+        # always computed with no_grad, meaning its parameters NEVER
+        # received gradients and the feature_validator was a dead module.
+        features = self.extractor(latent)
         
         # Simple clustering based on activation patterns
         feature_ids = []

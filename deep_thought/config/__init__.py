@@ -25,8 +25,8 @@ class RouterConfig:
     active_experts: int = 4
     hidden_dim: int = 1024
     noise_epsilon: float = 0.1
-    load_balance_loss_coef: float = 0.01
-    entropy_coef: float = 0.05  # Was 0.01 -- increased to prevent entropy collapse
+    load_balance_loss_coef: float = 0.1  # FIX: 10x increase to prevent routing collapse
+    entropy_coef: float = 0.1  # FIX: Higher to prevent routing collapse and ensure diverse expert usage
     min_entropy: float = 0.5
     max_entropy: float = 2.5
 
@@ -548,7 +548,7 @@ class TrainingConfig:
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
     value_loss_coef: float = 0.25  # Was 0.5 -- reduced to prevent value loss dominating
-    entropy_coef: float = 0.05  # Was 0.01 -- increased to prevent entropy collapse
+    entropy_coef: float = 0.1  # FIX: Higher to prevent routing collapse and ensure diverse expert usage
     max_grad_norm: float = 0.5
     target_kl: float = 0.05  # Was 0.01 -- too strict, prevented learning
     ppo_epochs: int = 4
