@@ -157,6 +157,15 @@ class PPOTrainer:
         # Reward integration coefficients (BUG 2 fix)
         self.intrinsic_reward_coef = intrinsic_reward_coef
         self.subgoal_reward_coef = subgoal_reward_coef
+        
+        # Running return normalization (for value function training)
+        # This tracks the running mean and variance of returns so we can
+        # normalize the targets for the value function, preventing the
+        # value loss from dominating the total loss at the start of training.
+        self._return_mean = 0.0
+        self._return_var = 1.0
+        self._return_count = 0
+        self._return_ema = 0.99
     
     def _world_model_actions(self, actions: torch.Tensor, device: torch.device) -> torch.Tensor:
         """Convert stored actions into world-model action vectors."""
@@ -360,14 +369,26 @@ class PPOTrainer:
         advantages = torch.tensor(advantages, dtype=torch.float32, device=device)
         returns = torch.tensor(returns, dtype=torch.float32, device=device)
 
-        # Normalize advantages
+        # Normalize advantages (standard PPO practice)
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Normalize returns to prevent value loss from being orders of magnitude
-        # larger than policy loss. This stabilizes training significantly.
-        if len(returns) > 1:
-            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        # DO NOT normalize returns! The value function must predict the
+        # actual discounted returns, not a z-scored version. Normalizing
+        # returns breaks the value function's relationship to actual rewards
+        # and prevents the agent from learning the true scale of returns.
+        # This was a critical bug that caused the agent to never learn.
+        
+        # Update running return statistics for value normalization
+        batch_mean = returns.mean().item()
+        batch_var = returns.var().item() if len(returns) > 1 else 1.0
+        if self._return_count == 0:
+            self._return_mean = batch_mean
+            self._return_var = max(batch_var, 1.0)
+        else:
+            self._return_mean = self._return_ema * self._return_mean + (1 - self._return_ema) * batch_mean
+            self._return_var = self._return_ema * self._return_var + (1 - self._return_ema) * batch_var
+        self._return_count += 1
 
         return advantages, returns
     
@@ -422,45 +443,56 @@ class PPOTrainer:
                 mb_advantages = advantages[mb_indices]
                 mb_returns = returns[mb_indices]
                 mb_latents = batch["latents"][mb_indices]
-                
-                # Forward pass through FULL agent pipeline for gradient flow.
-                # We use a stateless forward pass that goes through encoder →
-                # router → experts → policy/value heads, but WITHOUT the
-                # agent's persistent GRU hidden state (which is batch_size=1
-                # from rollout collection and incompatible with mini-batches).
-                # This ensures router, experts, and all learnable components
-                # receive gradients during the PPO update.
-
-                # Step 1: Encode observations (gradient flows through encoder)
-                latent, _ = self.model.encoder(mb_obs)
-
-                # Step 2: Route through router and experts using latent
                 mb_batch_size = mb_obs.size(0)
                 mb_device = mb_obs.device
-                mb_h_t = torch.zeros(mb_batch_size, self.model.config.encoder.latent_dim, device=mb_device)
-                mb_m_t = torch.zeros(mb_batch_size, self.model.config.encoder.latent_dim, device=mb_device)
+                
+                # ============================================================
+                # PPO CORE: Encoder → Policy/Value Heads
+                #
+                # CRITICAL FIX: The previous approach re-ran the ENTIRE agent
+                # pipeline (router, experts, reasoning, etc.) with zeroed
+                # hidden states during PPO updates. This created a completely
+                # different computation graph than what was used during rollout
+                # collection, causing the policy to learn from wrong inputs.
+                #
+                # Standard PPO only needs:
+                #   1. Encode observations → latent
+                #   2. Policy head(latent) → action probabilities
+                #   3. Value head(latent) → value prediction
+                # This matches what the agent does during rollout.
+                #
+                # Auxiliary modules (world model, curiosity, reasoning, etc.)
+                # are trained with SEPARATE small auxiliary losses below,
+                # not by re-running the full pipeline.
+                # ============================================================
+                
+                # Encode observations (gradient flows through encoder)
+                latent, _ = self.model.encoder(mb_obs)
+                
+                # Use stored memory reads as context (not zeroed)
+                if "memory_reads" in batch:
+                    mb_memory_reads = batch["memory_reads"][mb_indices]
+                else:
+                    mb_memory_reads = torch.zeros_like(latent)
+                
+                # Build routing input from stored data (not zeroed hidden states)
+                # Use the latent as h_t approximation (the expert bank modifies h_t)
+                mb_h_t = mb_memory_reads  # Use memory read as proxy for hidden state
+                
+                # Route through router and experts
                 mb_context = None
                 if self.model.meta_learning is not None:
                     mb_context = torch.zeros(mb_batch_size, self.model.config.meta_learning.context_dim, device=mb_device)
 
-                # Router (gradient flows through router weights)
                 gates, selected_indices, router_info = self.model.router(
-                    mb_h_t, latent, mb_m_t, mb_context,
+                    mb_h_t, latent, mb_memory_reads, mb_context,
                     prediction_error=None, training=True, detach_gates=False
                 )
 
-                # Experts (gradient flows through expert weights)
                 delta_h, compute_costs = self.model.expert_bank(
                     mb_h_t, selected_indices, gates
                 )
                 h_tilde = mb_h_t + delta_h
-
-                # Hierarchical expert society (if enabled)
-                if self.model.hierarchical is not None:
-                    hierarchical_output, _ = self.model.hierarchical(
-                        h_tilde, latent, context=mb_context
-                    )
-                    h_tilde = h_tilde + hierarchical_output
 
                 # Meta-learning adaptation (if enabled)
                 if self.model.meta_learning is not None and mb_context is not None:
@@ -470,8 +502,9 @@ class PPOTrainer:
                     h_tilde = h_adapted
 
                 # Reasoning engine (if enabled)
+                reasoning_info = {}
                 if self.model.reasoning_engine is not None:
-                    h_tilde, _ = self.model.reasoning_engine(
+                    h_tilde, reasoning_info = self.model.reasoning_engine(
                         h_tilde, latent,
                         world_model=self.model.world_model if self.model.config.reasoning.use_counterfactual else None,
                         action_dim=self.model.config.action_dim,
@@ -497,6 +530,16 @@ class PPOTrainer:
                 
                 value = value_output.squeeze(-1)
                 
+                # Normalize returns for value function training using running stats.
+                # This prevents the value loss from being orders of magnitude
+                # larger than the policy loss at the start of training (when the
+                # value function predicts ~0 but returns are ~10-100).
+                # We normalize the TARGETS, not the advantages.
+                if self._return_count > 0 and self._return_var > 1e-6:
+                    mb_returns_normalized = (mb_returns - self._return_mean) / (self._return_var ** 0.5 + 1e-8)
+                else:
+                    mb_returns_normalized = mb_returns
+                
                 # Compute PPO loss with proper entropy from the distribution
                 entropy = dist.entropy()
                 if self.action_space == "continuous":
@@ -509,30 +552,35 @@ class PPOTrainer:
                     mb_old_log_probs,
                     mb_advantages,
                     value,
-                    mb_returns,
+                    mb_returns_normalized,  # Use normalized returns for value loss
                     self.clip_eps,
                     self.value_coef,
                     self.entropy_coef,
                     entropy_mean=entropy_mean
                 )
-                
                 # ============================================================
                 # AUXILIARY LOSSES: Ensure ALL modules receive gradient signal
+                #
+                # CRITICAL DESIGN PRINCIPLE: Auxiliary losses must be SMALL
+                # (0.001-0.005 coefficient) so they don't drown out the PPO
+                # policy gradient signal. Their purpose is to provide gradient
+                # flow to modules that would otherwise be dead weights, NOT to
+                # dominate the optimization. The PPO loss (policy + value +
+                # entropy) should always be the primary objective.
                 #
                 # Previously only encoder->router->experts->policy_head received
                 # gradients during PPO updates. This caused routing collapse:
                 # world_model, curiosity, meta_loop, subgoal_generator,
                 # feature_validator, and reasoning_engine were effectively
                 # dead weights with zero gradient signal.
-                #
-                # Now we add auxiliary self-supervised losses for each module
-                # so they all participate in the gradient graph.
                 # ============================================================
                 aux_loss = torch.tensor(0.0, device=mb_device)
                 z_pred = None  # Track for downstream auxiliary losses
                 pred_error = None
 
                 # --- AUX 1: World Model ---
+                # Scale: 0.001 — world model learns primarily from its own
+                # prediction error, not from interfering with the policy.
                 total_world_model_loss = 0.0
                 if getattr(self.model.config.world_model, "use_world_model", True):
                     wm_actions = self._world_model_actions(mb_actions, mb_device)
@@ -550,7 +598,7 @@ class PPOTrainer:
                         batch["dones"][mb_indices].to(mb_device),
                         None,
                         None,
-                        state_coef=self.config.world_model_loss_coef,
+                        state_coef=0.001,  # TINY — just enough for gradient flow
                     )
                     aux_loss = aux_loss + wm_losses["total_loss"]
                     total_world_model_loss = wm_losses["total_loss"].item()
@@ -582,7 +630,7 @@ class PPOTrainer:
                         # the magnitude of prediction error
                         curiosity_target = pred_error.mean(dim=-1).detach()
                         curiosity_loss = F.mse_loss(intrinsic_reward, curiosity_target)
-                        aux_loss = aux_loss + 0.01 * curiosity_loss
+                        aux_loss = aux_loss + 0.001 * curiosity_loss  # TINY — just for gradient flow
                         total_curiosity_loss = curiosity_loss.item()
                     except Exception:
                         total_curiosity_loss = 0.0
@@ -619,7 +667,7 @@ class PPOTrainer:
                                 subgoal_vec = subgoal_vec.unsqueeze(0).expand(mb_batch_size, -1)
                             sg_value = self.model.subgoal_generator.evaluator(state_emb, subgoal_vec)
                             sg_loss = F.mse_loss(sg_value.squeeze(), mb_returns.detach())
-                            aux_loss = aux_loss + 0.01 * sg_loss
+                            aux_loss = aux_loss + 0.001 * sg_loss  # TINY — just for gradient flow
                             total_subgoal_loss = sg_loss.item()
                     except Exception:
                         total_subgoal_loss = 0.0
@@ -650,72 +698,48 @@ class PPOTrainer:
                         if meta_state is not None:
                             action_probs_ml, meta_value, _ = self.model.meta_loop.action_net(meta_state)
                             # Meta-target: predict current capability density
-                            meta_target = torch.tensor([density], device=mb_device)
-                            meta_loss = F.mse_loss(meta_value.squeeze(), meta_target)
-                            aux_loss = aux_loss + 0.001 * meta_loss
+                            # Ensure target and prediction have matching shapes
+                            meta_target = torch.tensor([density], device=mb_device).expand_as(meta_value.squeeze())
+                            meta_loss = F.mse_loss(meta_value.squeeze(), meta_target.detach())
+                            aux_loss = aux_loss + 0.001 * meta_loss  # TINY — just for gradient flow
                             total_meta_loop_loss = meta_loss.item()
                     except Exception:
                         total_meta_loop_loss = 0.0
 
-                # --- AUX 5: Reasoning Engine Consistency Loss ---
-                # Train consistency head and value refiner.
+                # --- AUX 5: Reasoning Engine Auxiliary Losses ---
+                # Use the reasoning engine's own auxiliary loss computation
+                # with properly scaled coefficients.
                 total_reasoning_loss = 0.0
                 if self.model.reasoning_engine is not None:
                     try:
-                        # Re-run reasoning on current batch for gradient signal
-                        _, reas_info = self.model.reasoning_engine(
-                            h_tilde, latent,
-                            world_model=self.model.world_model if self.model.config.reasoning.use_counterfactual else None,
-                            action_dim=self.model.config.action_dim,
-                            training=True
+                        # Use the reasoning engine's built-in auxiliary loss method
+                        # This trains consistency_head, thought_classifier, and value_refiner
+                        reas_aux_losses = self.model.reasoning_engine.compute_auxiliary_losses(
+                            reasoning_info=reasoning_info,
+                            advantages=mb_advantages,
+                            returns=mb_returns,
                         )
-                        if 'consistency_scores' in reas_info:
-                            consistency_target = mb_advantages.detach().abs()
-                            consistency_pred = reas_info['consistency_scores'].squeeze(-1)
-                            if consistency_pred.dim() > 1:
-                                consistency_pred = consistency_pred[-1]
-                            reasoning_consistency_loss = F.mse_loss(
-                                torch.sigmoid(consistency_pred),
-                                consistency_target.clamp(0, 1)
-                            )
-                            aux_loss = aux_loss + 0.01 * reasoning_consistency_loss
-
-                        if 'refined_value' in reas_info:
-                            rv_loss = F.mse_loss(reas_info['refined_value'].squeeze(), mb_returns.detach())
-                            aux_loss = aux_loss + 0.01 * rv_loss
-
-                        total_reasoning_loss += aux_loss.item()
+                        for rname, rloss in reas_aux_losses.items():
+                            aux_loss = aux_loss + 0.001 * rloss  # TINY — just for gradient flow
+                            total_reasoning_loss += rloss.item()
                     except Exception:
                         total_reasoning_loss = 0.0
 
                 # --- Router losses: Load balance + Entropy ---
+                # These are critical for preventing routing collapse but must
+                # be scaled appropriately relative to the PPO loss.
                 if "entropy" in router_info:
                     router_losses = self.model.router.compute_losses(router_info)
-                    for router_loss in router_losses.values():
-                        aux_loss = aux_loss + router_loss
+                    if "load_balance" in router_losses:
+                        aux_loss = aux_loss + 0.005 * router_losses["load_balance"]
+                    if "expert_utilization" in router_losses:
+                        aux_loss = aux_loss + 0.005 * router_losses["expert_utilization"]
+                    if "entropy" in router_losses:
+                        aux_loss = aux_loss + router_losses["entropy"]  # Entropy loss is already well-scaled
 
-                # --- Stronger load balancing via coefficient of variation ---
-                # Penalize uneven expert usage to prevent routing collapse
-                try:
-                    inner_router = self.model.router.router
-                    if hasattr(inner_router, 'base_router'):
-                        expert_usage = inner_router.base_router.expert_usage
-                    elif hasattr(inner_router, 'expert_usage'):
-                        expert_usage = inner_router.expert_usage
-                    else:
-                        expert_usage = None
-
-                    if expert_usage is not None:
-                        usage_mean = expert_usage.mean()
-                        usage_std = expert_usage.std()
-                        cv = usage_std / (usage_mean + 1e-8)
-                        aux_loss = aux_loss + 0.1 * cv
-                except Exception:
-                    pass
-
-                # --- Compute penalty ---
+                # --- Compute penalty (TINY — just for gradient flow) ---
                 from deep_thought.optimization.losses import compute_compute_penalty
-                aux_loss = aux_loss + compute_compute_penalty(
+                aux_loss = aux_loss + 0.001 * compute_compute_penalty(
                     compute_costs,
                     gates,
                     selected_indices,

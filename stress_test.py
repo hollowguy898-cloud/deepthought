@@ -1007,8 +1007,8 @@ def test_governance_capacity_ledger():
     print(f"  Budget: {budget}")
 
 
-@test("Governance - Fix 4: Decoupled routing (slow + fast gating)")
-def test_governance_decoupled_routing():
+@test("Governance - Fix 4: Differentiable routing (gradient flow to router weights)")
+def test_governance_differentiable_routing():
     from deep_thought.architecture.router import SparseRouter
     from deep_thought.config import RouterConfig
 
@@ -1019,15 +1019,24 @@ def test_governance_decoupled_routing():
     x_t = torch.randn(2, 32)
     m_t = torch.randn(2, 32)
 
-    # Fast path: gates should be detached (no gradient)
-    gates, indices, info = router(h_t, x_t, m_t, training=True, detach_gates=True)
-    assert not gates.requires_grad, "Fast path gates should not require grad (detached)"
-    print(f"  Fast gates require_grad: {gates.requires_grad}")
+    # Gates are always differentiable during training (fix for routing collapse)
+    gates, indices, info = router(h_t, x_t, m_t, training=True)
+    assert gates.requires_grad, "Training gates should require grad (differentiable)"
+    print(f"  Training gates require_grad: {gates.requires_grad}")
 
-    # Slow path: gates can have gradient for MEDIUM timescale update
-    gates_slow, indices_slow, info_slow = router(h_t, x_t, m_t, training=True, detach_gates=False)
-    # Note: gates may or may not require grad depending on computation graph
-    print(f"  Slow gates shape: {gates_slow.shape}")
+    # Verify gradient flows through to router weights
+    loss = gates.sum()
+    loss.backward()
+    base_router = router.router.base_router
+    assert base_router.router[0].weight.grad is not None, "Gradient should flow to router weights"
+    print(f"  Gradient flows to router weights: True")
+
+    # Verify load balance loss works with new API
+    losses = router.compute_losses(info)
+    assert "load_balance" in losses, "Should have load_balance loss"
+    assert "expert_utilization" in losses, "Should have expert_utilization loss"
+    print(f"  Load balance loss: {losses['load_balance'].item():.6f}")
+    print(f"  Expert utilization loss: {losses['expert_utilization'].item():.6f}")
 
 
 @test("Governance - Fix 5: Asymmetric memory read/write")
@@ -1409,7 +1418,7 @@ if __name__ == "__main__":
         test_governance_single_objective,
         test_governance_timescale,
         test_governance_capacity_ledger,
-        test_governance_decoupled_routing,
+        test_governance_differentiable_routing,
         test_governance_asymmetric_memory,
         test_governance_non_interference,
         test_governance_signal_normalizer,
