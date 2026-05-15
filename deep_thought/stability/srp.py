@@ -147,14 +147,23 @@ class SelfRegressionPrevention(nn.Module):
             self._neuron_explosion_detected = False
     
     def _update_architecture_gate(self, is_regressing: bool):
-        """Update architecture change gate based on stability."""
+        """Update architecture change gate based on stability.
+        
+        FIX: Previously, ALL architectural changes were frozen during
+        regression. This was too aggressive — during early training,
+        regression is normal and the system should still be allowed to
+        prune bad experts and adjust routing. Only GROWTH should be
+        blocked during regression (adding more params to a failing
+        system makes things worse).
+        """
         if is_regressing:
-            # Freeze structural changes during regression
-            self.allow_pruning = False
-            self.allow_growth = False
-            self.allow_routing_changes = False
+            # Only block GROWTH during regression. Pruning and routing
+            # changes are still useful — they can help the system recover.
+            self.allow_pruning = True   # Pruning can help remove bad experts
+            self.allow_growth = False   # Don't add more params during regression
+            self.allow_routing_changes = True  # Allow routing to adjust
         else:
-            # Allow changes when stable
+            # Allow all changes when stable
             self.allow_pruning = True
             self.allow_growth = True
             self.allow_routing_changes = True

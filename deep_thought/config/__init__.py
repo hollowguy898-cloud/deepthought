@@ -26,7 +26,7 @@ class RouterConfig:
     hidden_dim: int = 1024
     noise_epsilon: float = 0.1
     load_balance_loss_coef: float = 0.01
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.05  # Was 0.01 -- increased to prevent entropy collapse
     min_entropy: float = 0.5
     max_entropy: float = 2.5
 
@@ -56,7 +56,7 @@ class MemoryConfig:
     episodic_capacity: int = 10000
     episodic_key_dim: int = 256
     episodic_value_dim: int = 1024
-    importance_threshold: float = 0.5
+    importance_threshold: float = 0.1  # Was 0.5 -- too high, no memories stored
     
     # Semantic memory
     semantic_capacity: int = 5000
@@ -136,7 +136,7 @@ class SRPConfig:
     """Self-Regression Prevention configuration."""
     use_srp: bool = True
     performance_window: int = 1000
-    drift_threshold: float = 0.05
+    drift_threshold: float = 0.15  # Was 0.05 -- too sensitive, triggered regression during normal training
     stability_check_interval: int = 100
     max_fast_weight_norm: float = 10.0
     fast_weight_decay: float = 0.95
@@ -547,10 +547,10 @@ class TrainingConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    value_loss_coef: float = 0.5
-    entropy_coef: float = 0.01
+    value_loss_coef: float = 0.25  # Was 0.5 -- reduced to prevent value loss dominating
+    entropy_coef: float = 0.05  # Was 0.01 -- increased to prevent entropy collapse
     max_grad_norm: float = 0.5
-    target_kl: float = 0.01
+    target_kl: float = 0.05  # Was 0.01 -- too strict, prevented learning
     ppo_epochs: int = 4
     
     # World model loss coefficients

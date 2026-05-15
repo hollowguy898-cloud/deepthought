@@ -531,7 +531,8 @@ class DeepThoughtAgent(nn.Module):
             elif opponent_context.size(0) == 1 and batch_size > 1:
                 opponent_context = opponent_context.expand(batch_size, -1)
 
-        # Fix 4: Decoupled routing - slow router policy + fast deterministic gating
+        # Fix 4: Decoupled routing - during training, allow gradient flow through router
+        # so it can learn. During inference, detach gates for speed.
         # The router forward pass is always fast (deterministic top-k).
         # Router WEIGHT updates happen only at MEDIUM timescale, controlled by governor.
         gates, selected_indices, router_info = self.router(
@@ -540,7 +541,8 @@ class DeepThoughtAgent(nn.Module):
             self.m_t,
             self.context,
             prediction_error,
-            training=training
+            training=training,
+            detach_gates=not training  # Allow gradient flow during training
         )
         outputs["router_info"] = router_info
         outputs["gates"] = gates

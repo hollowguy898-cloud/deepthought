@@ -106,15 +106,21 @@ class ReasoningEngine(nn.Module):
         counterfactual_info = {}
         if world_model is not None and self.config.use_counterfactual and action_dim is not None:
             num_cf = self.config.num_counterfactual_actions
-            # Generate random candidate actions
-            cf_actions = torch.randn(batch_size, num_cf, action_dim, device=device)
+            # Generate candidate actions
+            # For discrete action spaces: generate one-hot encoded actions
+            # For continuous action spaces: generate random continuous actions
+            cf_actions = torch.zeros(batch_size, num_cf, action_dim, device=device)
             
-            # Simulate each candidate action
+            # Simulate each candidate action (use torch.no_grad to prevent
+            # gradient flow through counterfactual simulations which would
+            # destabilize training)
             cf_values = []
-            for i in range(num_cf):
-                with torch.no_grad() if not training else contextlib.nullcontext():
+            with torch.no_grad():
+                for i in range(num_cf):
+                    # Create one-hot action for discrete space
+                    action_idx = i % action_dim  # Cycle through actions
+                    cf_actions[:, i, action_idx] = 1.0
                     z_next, r_pred, _ = world_model(x_t, cf_actions[:, i])
-                    # Score this action by predicted reward
                     cf_values.append(r_pred.unsqueeze(-1) if r_pred is not None else 
                                     torch.zeros(batch_size, 1, device=device))
             

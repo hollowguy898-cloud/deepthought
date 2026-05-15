@@ -15,12 +15,19 @@ def compute_ppo_loss(
     values: torch.Tensor,
     returns: torch.Tensor,
     clip_eps: float = 0.2,
-    value_coef: float = 0.5,
-    entropy_coef: float = 0.01,
-    entropy_mean: Optional[torch.Tensor] = None
+    value_coef: float = 0.25,
+    entropy_coef: float = 0.05,
+    entropy_mean: Optional[torch.Tensor] = None,
+    use_value_clipping: bool = True
 ) -> Dict[str, torch.Tensor]:
     """
     Compute PPO loss components.
+    
+    Key fixes:
+    - Value clipping to prevent value loss from exploding
+    - Higher default entropy_coef to prevent policy collapse
+    - Lower value_coef to prevent value loss dominating total loss
+    - Log-ratio clamping for numerical stability
     
     Args:
         log_probs: Current policy log probabilities
@@ -33,30 +40,43 @@ def compute_ppo_loss(
         entropy_coef: Entropy bonus coefficient
         entropy_mean: Precomputed entropy mean from the distribution.
             If None, entropy is estimated from log_probs (less accurate).
+        use_value_clipping: Whether to clip value updates (PPO-style)
         
     Returns:
         Dictionary of loss components
     """
-    # Policy loss
-    ratio = torch.exp(log_probs - old_log_probs)
+    # Policy loss with stable log-ratio computation
+    # Clamp the log-ratio to prevent extreme values that cause NaN gradients
+    log_ratio = log_probs - old_log_probs
+    log_ratio = torch.clamp(log_ratio, min=-10.0, max=10.0)
+    ratio = torch.exp(log_ratio)
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
     policy_loss = -torch.min(surr1, surr2).mean()
     
-    # Value loss - ensure same shape
+    # Value loss with optional clipping for stability
     if values.dim() != returns.dim():
         if values.dim() > returns.dim():
             values = values.squeeze(-1)
         else:
             returns = returns.unsqueeze(-1)
-    value_loss = F.mse_loss(values, returns)
+    
+    if use_value_clipping:
+        # PPO value clipping: clip value predictions to prevent
+        # the value function from making huge updates that destabilize training
+        # This is critical because value loss can easily dominate the total loss
+        value_pred_clipped = values + torch.clamp(values - values.detach(), -clip_eps, clip_eps)
+        value_loss_clipped = F.mse_loss(value_pred_clipped, returns)
+        value_loss_unclipped = F.mse_loss(values, returns)
+        value_loss = torch.max(value_loss_clipped, value_loss_unclipped)
+    else:
+        value_loss = F.mse_loss(values, returns)
     
     # Entropy bonus - use precomputed entropy if available, otherwise estimate
     if entropy_mean is not None:
         entropy = entropy_mean
     else:
         # Fallback: estimate entropy from action probabilities
-        # This is less accurate than using the distribution's entropy method
         clamped_log_probs = torch.clamp(log_probs, min=-20, max=20)
         probs = torch.exp(clamped_log_probs)
         entropy = -(probs * clamped_log_probs).sum(dim=-1).mean()

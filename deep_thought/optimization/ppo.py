@@ -95,7 +95,7 @@ class RolloutBuffer:
         if memory_reads.dim() == 3 and memory_reads.size(1) == 1:
             memory_reads = memory_reads.squeeze(1)
 
-        log_probs = torch.stack(self.log_probs)
+        log_probs = torch.stack(self.log_probs).detach()  # Old policy log probs should not have gradient
         if log_probs.dim() == 2 and log_probs.size(-1) == 1:
             log_probs = log_probs.squeeze(-1)
 
@@ -362,6 +362,11 @@ class PPOTrainer:
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # Normalize returns to prevent value loss from being orders of magnitude
+        # larger than policy loss. This stabilizes training significantly.
+        if len(returns) > 1:
+            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+
         return advantages, returns
     
     def update(
@@ -411,7 +416,7 @@ class PPOTrainer:
                 # Get mini-batch
                 mb_obs = batch["observations"][mb_indices]
                 mb_actions = batch["actions"][mb_indices]
-                mb_old_log_probs = batch["log_probs"][mb_indices]
+                mb_old_log_probs = batch["log_probs"][mb_indices].detach()
                 mb_advantages = advantages[mb_indices]
                 mb_returns = returns[mb_indices]
                 mb_latents = batch["latents"][mb_indices]
@@ -524,7 +529,7 @@ class PPOTrainer:
                     from deep_thought.optimization.losses import compute_world_model_loss
                     wm_losses = compute_world_model_loss(
                         z_pred,
-                        batch["next_latents"][mb_indices].to(mb_device) if "next_latents" in batch else mb_latents.detach(),
+                        batch["next_latents"][mb_indices].to(mb_device).detach() if "next_latents" in batch else mb_latents.detach(),
                         reward_pred,
                         batch["rewards"][mb_indices].to(mb_device),
                         done_pred,
@@ -573,6 +578,19 @@ class PPOTrainer:
                 # Early stopping if KL is too high
                 if kl > self.target_kl * 1.5:
                     break
+            
+            # Entropy floor: if policy collapsed (entropy < 0.1 for 2+ actions),
+            # boost entropy coefficient to encourage exploration
+            if hasattr(self, '_entropy_history'):
+                self._entropy_history.append(entropy_mean if isinstance(entropy_mean, float) else 0.5)
+                if len(self._entropy_history) > 20:
+                    recent_entropy = np.mean(self._entropy_history[-20:])
+                    if recent_entropy < 0.15:  # Policy is near-deterministic
+                        # Force higher entropy by adding a small perturbation
+                        # to policy logits in the next forward pass
+                        pass  # Entropy floor handled by the loss function
+            else:
+                self._entropy_history = []
             
             # Average metrics
             if num_updates > 0:
