@@ -169,18 +169,18 @@ class EpisodicMemory(nn.Module):
             value = self.value_proj(latent.detach()).to(target_device)
             
             # Squeeze batch dimension if present
-            if key.dim() > 1 and key.size(0) == 1:
-                key = key.squeeze(0)
-            if value.dim() > 1 and value.size(0) == 1:
-                value = value.squeeze(0)
+            if key.dim() > 1:
+                key = key[0]
+            if value.dim() > 1:
+                value = value[0]
             
             obs_detached = observation.detach().to(target_device)
-            if obs_detached.dim() > 1 and obs_detached.size(0) == 1:
-                obs_detached = obs_detached.squeeze(0)
+            if obs_detached.dim() > 1:
+                obs_detached = obs_detached[0]
             
             act_detached = action.detach().to(target_device)
-            if act_detached.dim() > 1 and act_detached.size(0) == 1:
-                act_detached = act_detached.squeeze(0)
+            if act_detached.dim() > 1:
+                act_detached = act_detached[0]
         
         entry = MemoryEntry(
             key=key,
